@@ -1,0 +1,69 @@
+{
+  "universe_count": 36,
+  "max_scan_cap": 250,
+  "requested_count": 36,
+  "tickers_attempted": 36,
+  "scanned_count": 36,
+  "download_success_count": 36,
+  "missing_data_count": 0,
+  "not_enough_history_count": 0,
+  "snapshot_build_failed_count": 0,
+  "usable_snapshot_count": 36,
+  "failed_tickers": [],
+  "failure_reasons": {},
+  "duration_seconds": 2.5078787000002194,
+  "result_count": 36,
+  "scan_mode": "Fast Scan",
+  "valid_data_count": 36,
+  "prefilter_pass_count": 36,
+  "prefilter_scored_count": 36,
+  "prefilter_skip_reasons": {},
+  "market_regime": {
+    "market_regime": "Risk-On",
+    "market_regime_score": 15.0,
+    "market_regime_penalty": 0.0,
+    "above_sma50_count": 3,
+    "flags": {
+      "SPY": {
+        "close": 720.6500244140625,
+        "ema21": 699.5351839918037,
+        "sma50": 680.216201171875,
+        "sma200": 670.9401989746094,
+        "above_ema21": true,
+        "above_sma50": true,
+        "above_sma200": true
+      },
+      "QQQ": {
+        "close": 674.1500244140625,
+        "ema21": 641.0034820986953,
+        "sma50": 612.6617993164062,
+        "sma200": 604.0846493530273,
+        "above_ema21": true,
+        "above_sma50": true,
+        "above_sma200": true
+      },
+      "IWM": {
+        "close": 279.2799987792969,
+        "ema21": 269.7841686252014,
+        "sma50": 259.747799987793,
+        "sma200": 248.0895500946045,
+        "above_ema21": true,
+        "above_sma50": true,
+        "above_sma200": true
+      }
+    },
+    "summary": "SPY and QQQ are above EMA21/SMA50 and broad participation is supportive."
+  },
+  "calculate_historical_edge": false,
+  "timings": {
+    "universe_load_seconds": 3.3000001167238224e-06,
+    "data_fetch_seconds": 1.0009917000002133,
+    "prefilter_seconds": 0,
+    "scoring_seconds": 1.4717020000002776,
+    "save_seconds": 0.020912500000122236
+  },
+  "universe_name": "ELITE",
+  "last_updated": "2026-05-01T22:24:08",
+  "format": "parquet",
+  "snapshot_path": "C:\\Users\\m10h\\Documents\\stock-screener-v2\\data\\scanner_cache\\elite.parquet"
+}

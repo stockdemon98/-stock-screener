@@ -1,0 +1,36 @@
+{
+  "universe_count": 503,
+  "max_scan_cap": 510,
+  "requested_count": 503,
+  "tickers_attempted": 503,
+  "scanned_count": 502,
+  "download_success_count": 502,
+  "missing_data_count": 0,
+  "not_enough_history_count": 1,
+  "snapshot_build_failed_count": 0,
+  "usable_snapshot_count": 502,
+  "failed_tickers": [
+    "Q"
+  ],
+  "failure_reasons": {
+    "Q": "not enough history"
+  },
+  "duration_seconds": 81.81564719999983,
+  "result_count": 502,
+  "scan_mode": "Fast Scan",
+  "valid_data_count": 502,
+  "prefilter_pass_count": 502,
+  "prefilter_scored_count": 502,
+  "prefilter_skip_reasons": {},
+  "timings": {
+    "universe_load_seconds": 7.800000048518996e-06,
+    "data_fetch_seconds": 14.074174599999878,
+    "prefilter_seconds": 0,
+    "scoring_seconds": 67.71521060000009,
+    "save_seconds": 0.016973000000007232
+  },
+  "universe_name": "SP500_FULL",
+  "last_updated": "2026-04-30T20:42:45",
+  "format": "parquet",
+  "snapshot_path": "C:\\Users\\m10h\\Documents\\stock-screener-v2\\data\\scanner_cache\\sp500_full.parquet"
+}
