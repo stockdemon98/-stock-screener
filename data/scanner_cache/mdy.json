@@ -1,27 +1,36 @@
 {
   "universe_count": 400,
-  "max_scan_cap": 570,
+  "max_scan_cap": 470,
   "requested_count": 400,
   "tickers_attempted": 400,
   "scanned_count": 399,
   "download_success_count": 399,
   "missing_data_count": 0,
+  "invalid_ohlcv_count": 0,
   "not_enough_history_count": 1,
   "snapshot_build_failed_count": 0,
   "usable_snapshot_count": 399,
+  "deep_scored_count": 399,
+  "lightweight_snapshot_count": 0,
+  "retry_missing_data_count": 0,
+  "retry_recovered_count": 0,
   "failed_tickers": [
     "SOLS"
   ],
   "failure_reasons": {
     "SOLS": "not enough history"
   },
-  "duration_seconds": 26.58148879999999,
+  "duration_seconds": 29.207717799999955,
   "result_count": 399,
   "scan_mode": "Fast Scan",
   "valid_data_count": 399,
   "prefilter_pass_count": 399,
   "prefilter_scored_count": 399,
   "prefilter_skip_reasons": {},
+  "raw_symbols_loaded": null,
+  "non_common_removed": null,
+  "final_common_stocks": null,
+  "symbol_removal_reasons": {},
   "market_regime": {
     "market_regime": "Risk-On",
     "market_regime_score": 15.0,
@@ -29,28 +38,28 @@
     "above_sma50_count": 3,
     "flags": {
       "SPY": {
-        "close": 720.6500244140625,
-        "ema21": 699.5351839918037,
-        "sma50": 680.216201171875,
-        "sma200": 670.9401989746094,
+        "close": 756.47998046875,
+        "ema21": 737.0588364037579,
+        "sma50": 703.6470007324219,
+        "sma200": 681.1734991455078,
         "above_ema21": true,
         "above_sma50": true,
         "above_sma200": true
       },
       "QQQ": {
-        "close": 674.1500244140625,
-        "ema21": 641.0034820986953,
-        "sma50": 612.6617993164062,
-        "sma200": 604.0846493530273,
+        "close": 738.3099975585938,
+        "ema21": 705.3301000640007,
+        "sma50": 652.9311999511718,
+        "sma200": 617.8460494995118,
         "above_ema21": true,
         "above_sma50": true,
         "above_sma200": true
       },
       "IWM": {
-        "close": 279.2799987792969,
-        "ema21": 269.7841686252014,
-        "sma50": 259.747799987793,
-        "sma200": 248.0895500946045,
+        "close": 290.42999267578125,
+        "ema21": 282.38155347246345,
+        "sma50": 270.03560119628906,
+        "sma200": 253.93685020446776,
         "above_ema21": true,
         "above_sma50": true,
         "above_sma200": true
@@ -60,14 +69,15 @@
   },
   "calculate_historical_edge": false,
   "timings": {
-    "universe_load_seconds": 5.399999736255268e-06,
-    "data_fetch_seconds": 9.350963800000045,
-    "prefilter_seconds": 0,
-    "scoring_seconds": 16.79958170000009,
-    "save_seconds": 0.025552800000241405
+    "universe_load_seconds": 7.999999979801942e-06,
+    "data_fetch_seconds": 10.64171499999975,
+    "data_retry_seconds": 5.199999986871262e-05,
+    "prefilter_seconds": 3.0700000024808105e-05,
+    "scoring_seconds": 18.514584699999887,
+    "save_seconds": 0.027694000000337837
   },
   "universe_name": "MDY",
-  "last_updated": "2026-05-01T22:30:53",
+  "last_updated": "2026-05-29T19:28:32",
   "format": "parquet",
   "snapshot_path": "C:\\Users\\m10h\\Documents\\stock-screener-v2\\data\\scanner_cache\\mdy.parquet"
 }

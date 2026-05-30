@@ -1,6 +1,6 @@
 {
   "universe_count": 101,
-  "max_scan_cap": 250,
+  "max_scan_cap": 410,
   "requested_count": 101,
   "tickers_attempted": 101,
   "scanned_count": 101,
@@ -10,9 +10,13 @@
   "not_enough_history_count": 0,
   "snapshot_build_failed_count": 0,
   "usable_snapshot_count": 101,
+  "deep_scored_count": 101,
+  "lightweight_snapshot_count": 0,
+  "retry_missing_data_count": 0,
+  "retry_recovered_count": 0,
   "failed_tickers": [],
   "failure_reasons": {},
-  "duration_seconds": 7.732556500000101,
+  "duration_seconds": 7.604552799999965,
   "result_count": 101,
   "scan_mode": "Fast Scan",
   "valid_data_count": 101,
@@ -30,28 +34,28 @@
     "above_sma50_count": 3,
     "flags": {
       "SPY": {
-        "close": 754.5999755859375,
-        "ema21": 735.1167219972588,
-        "sma50": 701.7460009765625,
-        "sma200": 680.6045492553711,
+        "close": 756.47998046875,
+        "ema21": 737.0588364037579,
+        "sma50": 703.6470007324219,
+        "sma200": 681.1734991455078,
         "above_ema21": true,
         "above_sma50": true,
         "above_sma200": true
       },
       "QQQ": {
-        "close": 735.5999755859375,
-        "ema21": 702.0321103145415,
-        "sma50": 650.0630004882812,
-        "sma200": 617.0547494506836,
+        "close": 738.3099975585938,
+        "ema21": 705.3301000640007,
+        "sma50": 652.9311999511718,
+        "sma200": 617.8460494995118,
         "above_ema21": true,
         "above_sma50": true,
         "above_sma200": true
       },
       "IWM": {
-        "close": 292.0299987792969,
-        "ema21": 281.57670955213166,
-        "sma50": 269.1474014282227,
-        "sma200": 253.61875022888182,
+        "close": 290.42999267578125,
+        "ema21": 282.38155347246345,
+        "sma50": 270.03560119628906,
+        "sma200": 253.93685020446776,
         "above_ema21": true,
         "above_sma50": true,
         "above_sma200": true
@@ -61,14 +65,15 @@
   },
   "calculate_historical_edge": false,
   "timings": {
-    "universe_load_seconds": 5.80000005356851e-06,
-    "data_fetch_seconds": 2.846742099999574,
-    "prefilter_seconds": 0,
-    "scoring_seconds": 4.4437699999998586,
-    "save_seconds": 0.023784699999851
+    "universe_load_seconds": 6.100000064179767e-06,
+    "data_fetch_seconds": 2.8126075999998648,
+    "data_retry_seconds": 1.5500000245083356e-05,
+    "prefilter_seconds": 7.300000106624793e-06,
+    "scoring_seconds": 4.749829800000043,
+    "save_seconds": 0.025816200000008394
   },
   "universe_name": "QQQ",
-  "last_updated": "2026-05-28T19:33:26",
+  "last_updated": "2026-05-29T19:27:10",
   "format": "parquet",
   "snapshot_path": "C:\\Users\\m10h\\Documents\\stock-screener-v2\\data\\scanner_cache\\qqq.parquet"
 }

@@ -204,6 +204,7 @@ def render_snapshot_status(snapshot_meta: dict, snapshot_available: bool) -> Non
                 (
                     f"Refresh runtime: {snapshot_meta.get('duration_seconds', 0):.1f}s | "
                     f"Download: {timings.get('data_fetch_seconds', 0):.1f}s | "
+                    f"Retry: {timings.get('data_retry_seconds', 0):.1f}s | "
                     f"Snapshot prep: {timings.get('prefilter_seconds', 0):.1f}s | "
                     f"Trend prep: {timings.get('scoring_seconds', 0):.1f}s | "
                     f"Save: {timings.get('save_seconds', 0):.1f}s"
@@ -264,6 +265,8 @@ def main() -> None:
         st.session_state["breakout_scan_key"] = None
     if "saved_setups" not in st.session_state:
         st.session_state["saved_setups"] = []
+    if "last_auto_open_search_ticker" not in st.session_state:
+        st.session_state["last_auto_open_search_ticker"] = None
 
     universe_names = get_universe_names()
     valid_universes = set(universe_names)
@@ -283,6 +286,9 @@ def main() -> None:
         calculate_historical_edge,
     ) = render_controls(universe_names)
     search_ticker, memberships, search_result, search_error = evaluate_ticker_search(raw_search_ticker)
+    if search_ticker and search_result and st.session_state.get("last_auto_open_search_ticker") != search_ticker:
+        st.session_state["selected_ticker"] = search_ticker
+        st.session_state["last_auto_open_search_ticker"] = search_ticker
 
     if search_ticker:
         render_search_result(

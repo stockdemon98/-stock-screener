@@ -696,6 +696,38 @@ def get_initial_range(chart_data: pd.DataFrame, timeframe: str) -> list[pd.Times
     return [chart_data["Date"].iloc[-default_window], chart_data["Date"].iloc[-1]]
 
 
+def get_visible_price_range(chart_data: pd.DataFrame, controls: dict, initial_range: list[pd.Timestamp]) -> list[float] | None:
+    if chart_data.empty or len(initial_range) != 2:
+        return None
+
+    visible_data = chart_data[(chart_data["Date"] >= initial_range[0]) & (chart_data["Date"] <= initial_range[1])]
+    if visible_data.empty:
+        visible_data = chart_data
+
+    columns = ["Low", "High", "Close"]
+    for column, control_key in (
+        ("EMA8", "show_ema8"),
+        ("EMA21", "show_ema21"),
+        ("SMA50", "show_sma50"),
+        ("SMA100", "show_sma100"),
+        ("SMA200", "show_sma200"),
+    ):
+        if controls.get(control_key) and column in visible_data.columns:
+            columns.append(column)
+
+    values = visible_data[[column for column in columns if column in visible_data.columns]].stack().dropna()
+    if values.empty:
+        return None
+
+    low = float(values.min())
+    high = float(values.max())
+    if low == high:
+        padding = max(abs(low) * 0.05, 1.0)
+    else:
+        padding = max((high - low) * 0.08, high * 0.005)
+    return [max(low - padding, 0), high + padding]
+
+
 def add_rsi_trace(fig: go.Figure, chart_data: pd.DataFrame, row: int) -> bool:
     if chart_data.empty or "RSI14" not in chart_data.columns:
         return False
@@ -731,6 +763,7 @@ def style_figure(fig: go.Figure, chart_data: pd.DataFrame, controls: dict, row_c
     show_volume = controls.get("show_volume", True)
     timeframe = controls.get("timeframe", "1Y")
     initial_range = get_initial_range(chart_data, timeframe)
+    price_range = get_visible_price_range(chart_data, controls, initial_range)
     fig.update_layout(
         template="plotly_white",
         paper_bgcolor=CHART_BG,
@@ -756,7 +789,7 @@ def style_figure(fig: go.Figure, chart_data: pd.DataFrame, controls: dict, row_c
             row=row,
             col=1,
         )
-    fig.update_yaxes(showgrid=True, gridcolor=GRID_COLOR, fixedrange=False, zerolinecolor=GRID_COLOR, side="right", row=1, col=1)
+    fig.update_yaxes(showgrid=True, gridcolor=GRID_COLOR, fixedrange=False, zerolinecolor=GRID_COLOR, side="right", range=price_range, row=1, col=1)
     if volume_row is not None:
         fig.update_yaxes(showgrid=True, gridcolor=GRID_COLOR, fixedrange=False, zerolinecolor=GRID_COLOR, row=volume_row, col=1)
     if rsi_row is not None:

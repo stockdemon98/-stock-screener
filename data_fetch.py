@@ -26,6 +26,7 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+SEC_COMPANY_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
 SEC_USER_AGENT = "StockScreener/1.0 contact@example.com"
 SECTOR_WACC_FALLBACKS = {
@@ -214,6 +215,14 @@ def calculate_target_mean_upside(current_price: object, target_mean_price: objec
     return ((target_mean_value / current_price_value) - 1) * 100
 
 
+def calculate_distance_from_level(current_price: object, reference_level: object) -> float | None:
+    current_price_value = safe_float(current_price)
+    reference_level_value = safe_float(reference_level)
+    if current_price_value is None or reference_level_value in (None, 0):
+        return None
+    return ((current_price_value / reference_level_value) - 1) * 100
+
+
 def value_or_na(value: object) -> object:
     return FUNDAMENTAL_NA if value is None else value
 
@@ -258,7 +267,42 @@ def build_fundamental_quality_summary(snapshot: dict) -> dict:
         return points * (favorable / len(values))
 
     score = 0.0
-    score += score_positive("Profitability", ("Gross Margin", "Operating Margin", "Profit Margin", "Return on Equity", "Return on Assets"), 25)
+    income_statement_score = score_positive(
+        "Income Statement - TTM",
+        (
+            "Revenue (TTM)",
+            "Gross Profit (TTM)",
+            "Cost of Revenue (TTM)",
+            "R&D Expense (TTM)",
+            "SG&A Expense (TTM)",
+            "Operating Income (TTM)",
+            "EBITDA (TTM)",
+            "D&A (TTM)",
+            "Interest Expense (TTM)",
+            "Pretax Income (TTM)",
+            "Income Tax Expense (TTM)",
+            "Net Income (TTM)",
+            "Basic EPS (TTM)",
+            "Diluted EPS (TTM)",
+        ),
+        12,
+    )
+    margins_score = score_positive(
+        "Margins / Returns",
+        (
+            "Gross Margin (TTM)",
+            "Latest Quarter Gross Margin",
+            "Operating Margin (TTM)",
+            "Latest Quarter Operating Margin",
+            "Net Margin (TTM)",
+            "Latest Quarter Net Margin",
+            "Return on Equity",
+            "Return on Assets",
+            "Free Cash Flow Margin (TTM)",
+        ),
+        18,
+    )
+    score += max(income_statement_score, margins_score)
     score += score_positive("Growth", ("Revenue Growth", "Earnings Growth", "Quarterly Revenue Growth YoY", "Quarterly Earnings Growth YoY"), 20)
     score += score_balance_sheet(20)
     score += score_positive("Cash Flow", ("Operating Cash Flow", "Free Cash Flow", "Levered Free Cash Flow"), 15)
@@ -370,6 +414,566 @@ def get_latest_sec_filing(ticker: str) -> dict:
         }
 
     return {}
+
+
+def get_sec_fact_entries(company_facts: dict, tag_names: tuple[str, ...], units: tuple[str, ...]) -> list[dict]:
+    us_gaap = (company_facts.get("facts") or {}).get("us-gaap") or {}
+    entries: list[dict] = []
+    for tag_name in tag_names:
+        unit_map = (us_gaap.get(tag_name) or {}).get("units") or {}
+        for unit_name in units:
+            for entry in unit_map.get(unit_name, []):
+                value = safe_float(entry.get("val"))
+                if value is None:
+                    continue
+                entries.append(
+                    {
+                        **entry,
+                        "tag": tag_name,
+                        "unit": unit_name,
+                        "value": value,
+                    }
+                )
+    return entries
+
+
+def sec_entry_sort_key(entry: dict) -> tuple:
+    return (
+        str(entry.get("end") or ""),
+        str(entry.get("filed") or ""),
+        str(entry.get("form") or ""),
+    )
+
+
+def is_quarterly_duration_fact(entry: dict) -> bool:
+    frame = str(entry.get("frame") or "")
+    form = str(entry.get("form") or "")
+    return form in {"10-Q", "10-K"} and frame.startswith("CY") and "Q" in frame and not frame.endswith("I")
+
+
+def latest_quarterly_facts(company_facts: dict, tag_names: tuple[str, ...], quarters: int = 4) -> list[dict]:
+    entries = [
+        entry
+        for entry in get_sec_fact_entries(company_facts, tag_names, ("USD",))
+        if is_quarterly_duration_fact(entry)
+    ]
+    entries.sort(key=sec_entry_sort_key, reverse=True)
+    latest_by_period: dict[tuple[str, str], dict] = {}
+    for entry in entries:
+        period_key = (str(entry.get("start") or ""), str(entry.get("end") or ""))
+        if period_key in latest_by_period:
+            continue
+        latest_by_period[period_key] = entry
+        if len(latest_by_period) >= quarters:
+            break
+    return list(latest_by_period.values())
+
+
+def sum_latest_quarters(company_facts: dict, tag_names: tuple[str, ...], quarters: int = 4) -> tuple[float | None, list[dict]]:
+    facts = latest_quarterly_facts(company_facts, tag_names, quarters=quarters)
+    if not facts:
+        return None, []
+    return sum(float(entry["value"]) for entry in facts), facts
+
+
+def parse_sec_date(value: object) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def sec_fact_duration_days(entry: dict) -> int | None:
+    start_date = parse_sec_date(entry.get("start"))
+    end_date = parse_sec_date(entry.get("end"))
+    if start_date is None or end_date is None or end_date < start_date:
+        return None
+    return (end_date - start_date).days + 1
+
+
+def get_sec_duration_facts(company_facts: dict, tag_names: tuple[str, ...], units: tuple[str, ...] = ("USD",)) -> list[dict]:
+    return [
+        entry
+        for entry in get_sec_fact_entries(company_facts, tag_names, units)
+        if str(entry.get("form") or "") in {"10-Q", "10-K"} and sec_fact_duration_days(entry) is not None
+    ]
+
+
+def latest_annual_fact(company_facts: dict, tag_names: tuple[str, ...], before_end: date | None = None, units: tuple[str, ...] = ("USD",)) -> dict | None:
+    entries = []
+    for entry in get_sec_duration_facts(company_facts, tag_names, units=units):
+        end_date = parse_sec_date(entry.get("end"))
+        duration = sec_fact_duration_days(entry)
+        if (
+            str(entry.get("form") or "") == "10-K"
+            and duration is not None
+            and 300 <= duration <= 400
+            and (before_end is None or (end_date is not None and end_date < before_end))
+        ):
+            entries.append(entry)
+    return sorted(entries, key=sec_entry_sort_key, reverse=True)[0] if entries else None
+
+
+def latest_interim_ytd_fact(company_facts: dict, tag_names: tuple[str, ...], units: tuple[str, ...] = ("USD",)) -> dict | None:
+    entries = [
+        entry
+        for entry in get_sec_duration_facts(company_facts, tag_names, units=units)
+        if str(entry.get("form") or "") == "10-Q"
+    ]
+    if not entries:
+        return None
+
+    latest_end = max((parse_sec_date(entry.get("end")) for entry in entries), default=None)
+    if latest_end is None:
+        return None
+    latest_entries = [entry for entry in entries if parse_sec_date(entry.get("end")) == latest_end]
+    latest_entries.sort(
+        key=lambda entry: (
+            sec_fact_duration_days(entry) or 0,
+            str(entry.get("filed") or ""),
+            str(entry.get("frame") or ""),
+        ),
+        reverse=True,
+    )
+    return latest_entries[0] if latest_entries else None
+
+
+def latest_standalone_quarter_fact(company_facts: dict, tag_names: tuple[str, ...], units: tuple[str, ...] = ("USD",)) -> dict | None:
+    entries = [
+        entry
+        for entry in get_sec_duration_facts(company_facts, tag_names, units=units)
+        if is_quarterly_duration_fact(entry)
+    ]
+    return sorted(entries, key=sec_entry_sort_key, reverse=True)[0] if entries else None
+
+
+def comparable_prior_ytd_fact(company_facts: dict, tag_names: tuple[str, ...], current_ytd: dict, annual_fact: dict | None, units: tuple[str, ...] = ("USD",)) -> dict | None:
+    current_end = parse_sec_date(current_ytd.get("end"))
+    annual_end = parse_sec_date((annual_fact or {}).get("end"))
+    current_duration = sec_fact_duration_days(current_ytd)
+    if current_end is None or annual_end is None or current_duration is None:
+        return None
+
+    duration_gap = max(14, int(current_duration * 0.20))
+    current_fp = str(current_ytd.get("fp") or "")
+    entries = []
+    for entry in get_sec_duration_facts(company_facts, tag_names, units=units):
+        if str(entry.get("form") or "") != "10-Q":
+            continue
+        end_date = parse_sec_date(entry.get("end"))
+        duration = sec_fact_duration_days(entry)
+        if end_date is None or duration is None:
+            continue
+        if end_date >= annual_end:
+            continue
+        if abs(duration - current_duration) > duration_gap:
+            continue
+        entries.append(entry)
+
+    if current_fp:
+        matching_fp = [entry for entry in entries if str(entry.get("fp") or "") == current_fp]
+        if matching_fp:
+            entries = matching_fp
+    if not entries:
+        return None
+
+    entries.sort(
+        key=lambda entry: (
+            abs((current_end - parse_sec_date(entry.get("end"))).days - 365),
+            str(entry.get("filed") or ""),
+        )
+    )
+    return entries[0]
+
+
+def calculate_sec_ttm_fact(company_facts: dict, tag_names: tuple[str, ...], units: tuple[str, ...] = ("USD",)) -> tuple[float | None, list[dict]]:
+    interim_ytd = latest_interim_ytd_fact(company_facts, tag_names, units=units)
+    latest_annual = latest_annual_fact(company_facts, tag_names, units=units)
+
+    if latest_annual is not None:
+        annual_end = parse_sec_date(latest_annual.get("end"))
+        interim_end = parse_sec_date((interim_ytd or {}).get("end"))
+        if interim_ytd is None or (annual_end is not None and interim_end is not None and annual_end >= interim_end):
+            return float(latest_annual["value"]), [latest_annual]
+
+    if interim_ytd is not None:
+        interim_end = parse_sec_date(interim_ytd.get("end"))
+        prior_annual = latest_annual_fact(company_facts, tag_names, before_end=interim_end, units=units)
+        prior_ytd = comparable_prior_ytd_fact(company_facts, tag_names, interim_ytd, prior_annual, units=units)
+        if prior_annual is not None and prior_ytd is not None:
+            return (
+                float(interim_ytd["value"]) + float(prior_annual["value"]) - float(prior_ytd["value"]),
+                [interim_ytd, prior_annual, prior_ytd],
+            )
+
+    if units == ("USD",):
+        return sum_latest_quarters(company_facts, tag_names)
+    return None, []
+
+
+def latest_quarter_value(company_facts: dict, tag_names: tuple[str, ...], units: tuple[str, ...] = ("USD",)) -> tuple[float | None, dict | None]:
+    fact = latest_standalone_quarter_fact(company_facts, tag_names, units=units)
+    return (float(fact["value"]), fact) if fact else (None, None)
+
+
+def latest_sec_fact(company_facts: dict, tag_names: tuple[str, ...], units: tuple[str, ...] = ("USD",)) -> dict | None:
+    entries = get_sec_fact_entries(company_facts, tag_names, units)
+    if not entries:
+        return None
+    return sorted(entries, key=sec_entry_sort_key, reverse=True)[0]
+
+
+def get_sec_fact_value(company_facts: dict, tag_names: tuple[str, ...], units: tuple[str, ...] = ("USD",)) -> tuple[float | None, dict | None]:
+    entry = latest_sec_fact(company_facts, tag_names, units=units)
+    return (float(entry["value"]), entry) if entry else (None, None)
+
+
+@st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
+def get_sec_company_facts(ticker: str) -> dict:
+    normalized_ticker = ticker.strip().upper()
+    if not normalized_ticker:
+        return {}
+    cik = get_sec_ticker_cik_map().get(normalized_ticker)
+    if not cik:
+        return {}
+    try:
+        return fetch_sec_json(SEC_COMPANY_FACTS_URL.format(cik=cik))
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return {}
+
+
+@st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
+def get_sec_dcf_inputs(ticker: str) -> dict:
+    normalized_ticker = ticker.strip().upper()
+    company_facts = get_sec_company_facts(normalized_ticker)
+    if not company_facts:
+        return {"available": False, "source": "SEC company facts unavailable."}
+
+    revenue_tags = (
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues",
+        "SalesRevenueNet",
+    )
+    operating_income_tags = (
+        "OperatingIncomeLoss",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+    )
+    gross_profit_tags = ("GrossProfit",)
+    cost_of_revenue_tags = (
+        "CostOfRevenue",
+        "CostOfGoodsAndServicesSold",
+        "CostOfGoodsSold",
+        "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization",
+        "CostOfGoodsAndServiceIncludingDepreciationDepletionAndAmortization",
+    )
+    rd_tags = ("ResearchAndDevelopmentExpense", "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost")
+    sga_tags = ("SellingGeneralAndAdministrativeExpense", "SellingAndMarketingExpense")
+    net_income_tags = (
+        "NetIncomeLoss",
+        "ProfitLoss",
+        "NetIncomeLossAvailableToCommonStockholdersBasic",
+    )
+    pretax_income_tags = (
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+    )
+    tax_expense_tags = ("IncomeTaxExpenseBenefit",)
+    interest_expense_tags = ("InterestExpenseNonOperating", "InterestExpense")
+    depreciation_tags = (
+        "DepreciationDepletionAndAmortization",
+        "DepreciationDepletionAndAmortizationExpense",
+        "DepreciationAndAmortization",
+    )
+    eps_basic_tags = ("EarningsPerShareBasic",)
+    eps_diluted_tags = ("EarningsPerShareDiluted",)
+
+    revenue_ttm, revenue_facts = calculate_sec_ttm_fact(company_facts, revenue_tags)
+    operating_income_ttm, operating_income_facts = calculate_sec_ttm_fact(company_facts, operating_income_tags)
+    gross_profit_ttm, gross_profit_facts = calculate_sec_ttm_fact(company_facts, gross_profit_tags)
+    cost_of_revenue_ttm, cost_of_revenue_facts = calculate_sec_ttm_fact(company_facts, cost_of_revenue_tags)
+    rd_ttm, rd_facts = calculate_sec_ttm_fact(company_facts, rd_tags)
+    sga_ttm, sga_facts = calculate_sec_ttm_fact(company_facts, sga_tags)
+    net_income_ttm, net_income_facts = calculate_sec_ttm_fact(company_facts, net_income_tags)
+    pretax_income_ttm, pretax_income_facts = calculate_sec_ttm_fact(company_facts, pretax_income_tags)
+    tax_expense_ttm, tax_expense_facts = calculate_sec_ttm_fact(company_facts, tax_expense_tags)
+    interest_expense_ttm, interest_expense_facts = calculate_sec_ttm_fact(company_facts, interest_expense_tags)
+    depreciation_ttm, depreciation_facts = calculate_sec_ttm_fact(company_facts, depreciation_tags)
+    eps_basic_ttm, eps_basic_facts = calculate_sec_ttm_fact(company_facts, eps_basic_tags, units=("USD/shares",))
+    eps_diluted_ttm, eps_diluted_facts = calculate_sec_ttm_fact(company_facts, eps_diluted_tags, units=("USD/shares",))
+    operating_cash_flow_ttm, _operating_cash_flow_facts = calculate_sec_ttm_fact(
+        company_facts,
+        ("NetCashProvidedByUsedInOperatingActivities",),
+    )
+    capex_ttm, _capex_facts = calculate_sec_ttm_fact(
+        company_facts,
+        ("PaymentsToAcquirePropertyPlantAndEquipment", "CapitalExpenditures"),
+    )
+    if gross_profit_ttm is None and revenue_ttm is not None and cost_of_revenue_ttm is not None:
+        gross_profit_ttm = revenue_ttm - cost_of_revenue_ttm
+
+    latest_quarter_revenue, latest_quarter_revenue_fact = latest_quarter_value(company_facts, revenue_tags)
+    latest_quarter_operating_income, latest_quarter_operating_income_fact = latest_quarter_value(
+        company_facts,
+        operating_income_tags,
+    )
+    latest_quarter_gross_profit, latest_quarter_gross_profit_fact = latest_quarter_value(company_facts, gross_profit_tags)
+    latest_quarter_cost_of_revenue, latest_quarter_cost_of_revenue_fact = latest_quarter_value(
+        company_facts,
+        cost_of_revenue_tags,
+    )
+    latest_quarter_rd, _latest_quarter_rd_fact = latest_quarter_value(company_facts, rd_tags)
+    latest_quarter_sga, _latest_quarter_sga_fact = latest_quarter_value(company_facts, sga_tags)
+    latest_quarter_net_income, _latest_quarter_net_income_fact = latest_quarter_value(company_facts, net_income_tags)
+    latest_quarter_pretax_income, _latest_quarter_pretax_income_fact = latest_quarter_value(company_facts, pretax_income_tags)
+    latest_quarter_tax_expense, _latest_quarter_tax_expense_fact = latest_quarter_value(company_facts, tax_expense_tags)
+    latest_quarter_interest_expense, _latest_quarter_interest_expense_fact = latest_quarter_value(company_facts, interest_expense_tags)
+    latest_quarter_eps_basic, _latest_quarter_eps_basic_fact = latest_quarter_value(company_facts, eps_basic_tags, units=("USD/shares",))
+    latest_quarter_eps_diluted, _latest_quarter_eps_diluted_fact = latest_quarter_value(company_facts, eps_diluted_tags, units=("USD/shares",))
+    if (
+        latest_quarter_gross_profit is None
+        and latest_quarter_revenue is not None
+        and latest_quarter_cost_of_revenue is not None
+    ):
+        latest_quarter_gross_profit = latest_quarter_revenue - latest_quarter_cost_of_revenue
+    cash, cash_fact = get_sec_fact_value(
+        company_facts,
+        (
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        ),
+    )
+    short_debt, _short_debt_fact = get_sec_fact_value(
+        company_facts,
+        (
+            "ShortTermBorrowings",
+            "ShortTermDebt",
+            "LongTermDebtAndFinanceLeaseObligationsCurrent",
+            "LongTermDebtCurrent",
+        ),
+    )
+    long_debt, long_debt_fact = get_sec_fact_value(
+        company_facts,
+        (
+            "LongTermDebtNoncurrent",
+            "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
+        ),
+    )
+    total_debt, total_debt_fact = get_sec_fact_value(
+        company_facts,
+        (
+            "LongTermDebtAndFinanceLeaseObligations",
+            "LongTermDebt",
+            "DebtAndFinanceLeaseObligations",
+        ),
+    )
+    if total_debt is None:
+        total_debt = (short_debt or 0.0) + (long_debt or 0.0)
+        total_debt_fact = long_debt_fact
+
+    shares, shares_fact = get_sec_fact_value(
+        company_facts,
+        ("EntityCommonStockSharesOutstanding", "CommonStocksIncludingAdditionalPaidInCapitalMember"),
+        units=("shares",),
+    )
+    diluted_shares, diluted_shares_fact = get_sec_fact_value(
+        company_facts,
+        ("WeightedAverageNumberOfDilutedSharesOutstanding", "WeightedAverageNumberOfSharesOutstandingDiluted"),
+        units=("shares",),
+    )
+    if shares is None:
+        shares = diluted_shares
+        shares_fact = diluted_shares_fact
+    minority_interest, minority_fact = get_sec_fact_value(
+        company_facts,
+        ("MinorityInterest", "NoncontrollingInterestInConsolidatedEntity"),
+    )
+    investments, investments_fact = get_sec_fact_value(
+        company_facts,
+        ("ShortTermInvestments", "MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent"),
+    )
+    total_assets, total_assets_fact = get_sec_fact_value(company_facts, ("Assets",))
+    current_assets, _current_assets_fact = get_sec_fact_value(company_facts, ("AssetsCurrent",))
+    total_liabilities, _total_liabilities_fact = get_sec_fact_value(company_facts, ("Liabilities",))
+    current_liabilities, _current_liabilities_fact = get_sec_fact_value(company_facts, ("LiabilitiesCurrent",))
+    stockholders_equity, stockholders_equity_fact = get_sec_fact_value(
+        company_facts,
+        ("StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
+    )
+    retained_earnings, _retained_earnings_fact = get_sec_fact_value(company_facts, ("RetainedEarningsAccumulatedDeficit",))
+    inventory, _inventory_fact = get_sec_fact_value(company_facts, ("InventoryNet", "InventoryFinishedGoodsNetOfReserves"))
+    receivables, _receivables_fact = get_sec_fact_value(
+        company_facts,
+        ("AccountsReceivableNetCurrent", "ReceivablesNetCurrent"),
+    )
+    payables, _payables_fact = get_sec_fact_value(company_facts, ("AccountsPayableCurrent", "AccountsPayableTradeCurrent"))
+    free_cash_flow = None
+    if operating_cash_flow_ttm is not None:
+        free_cash_flow = operating_cash_flow_ttm - (capex_ttm or 0.0)
+
+    ebitda_ttm = None
+    if operating_income_ttm is not None and depreciation_ttm is not None:
+        ebitda_ttm = operating_income_ttm + depreciation_ttm
+    operating_margin = None
+    if revenue_ttm not in (None, 0) and operating_income_ttm is not None:
+        operating_margin = operating_income_ttm / revenue_ttm
+    gross_margin = None
+    if revenue_ttm not in (None, 0) and gross_profit_ttm is not None:
+        gross_margin = gross_profit_ttm / revenue_ttm
+    latest_quarter_operating_margin = None
+    if latest_quarter_revenue not in (None, 0) and latest_quarter_operating_income is not None:
+        latest_quarter_operating_margin = latest_quarter_operating_income / latest_quarter_revenue
+    latest_quarter_gross_margin = None
+    if latest_quarter_revenue not in (None, 0) and latest_quarter_gross_profit is not None:
+        latest_quarter_gross_margin = latest_quarter_gross_profit / latest_quarter_revenue
+    net_margin = None
+    if revenue_ttm not in (None, 0) and net_income_ttm is not None:
+        net_margin = net_income_ttm / revenue_ttm
+    latest_quarter_net_margin = None
+    if latest_quarter_revenue not in (None, 0) and latest_quarter_net_income is not None:
+        latest_quarter_net_margin = latest_quarter_net_income / latest_quarter_revenue
+    effective_tax_rate = None
+    if pretax_income_ttm not in (None, 0) and tax_expense_ttm is not None:
+        effective_tax_rate = tax_expense_ttm / pretax_income_ttm
+    current_ratio = None
+    if current_assets is not None and current_liabilities not in (None, 0):
+        current_ratio = current_assets / current_liabilities
+    debt_to_equity = None
+    if total_debt is not None and stockholders_equity not in (None, 0):
+        debt_to_equity = total_debt / stockholders_equity
+    return_on_assets = None
+    if net_income_ttm is not None and total_assets not in (None, 0):
+        return_on_assets = net_income_ttm / total_assets
+    return_on_equity = None
+    if net_income_ttm is not None and stockholders_equity not in (None, 0):
+        return_on_equity = net_income_ttm / stockholders_equity
+    fcf_margin = None
+    if revenue_ttm not in (None, 0) and free_cash_flow is not None:
+        fcf_margin = free_cash_flow / revenue_ttm
+
+    source_entry = next(
+        (
+            entry
+            for entry in (
+                revenue_facts
+                + operating_income_facts
+                + gross_profit_facts
+                + cost_of_revenue_facts
+                + net_income_facts
+                + pretax_income_facts
+                + tax_expense_facts
+                + rd_facts
+                + sga_facts
+                + interest_expense_facts
+                + depreciation_facts
+                + eps_basic_facts
+                + eps_diluted_facts
+            )
+            if entry
+        ),
+        latest_quarter_revenue_fact
+        or latest_quarter_operating_income_fact
+        or latest_quarter_gross_profit_fact
+        or latest_quarter_cost_of_revenue_fact
+        or cash_fact
+        or total_debt_fact
+        or total_assets_fact
+        or stockholders_equity_fact
+        or shares_fact
+        or minority_fact
+        or investments_fact,
+    )
+    source_periods = sorted(
+        {
+            str(entry.get("end"))
+            for entry in (
+                revenue_facts
+                + operating_income_facts
+                + gross_profit_facts
+                + cost_of_revenue_facts
+                + net_income_facts
+                + pretax_income_facts
+                + tax_expense_facts
+                + rd_facts
+                + sga_facts
+                + interest_expense_facts
+                + depreciation_facts
+                + eps_basic_facts
+                + eps_diluted_facts
+            )
+            if entry.get("end")
+        },
+        reverse=True,
+    )
+    return {
+        "available": any(value is not None for value in (revenue_ttm, operating_income_ttm, cash, total_debt, shares)),
+        "source": "SEC companyfacts XBRL",
+        "cik": company_facts.get("cik"),
+        "entity_name": company_facts.get("entityName"),
+        "latest_form": source_entry.get("form") if source_entry else None,
+        "latest_filed": source_entry.get("filed") if source_entry else None,
+        "latest_period": source_entry.get("end") if source_entry else None,
+        "source_periods": source_periods[:4],
+        "totalRevenue": revenue_ttm,
+        "grossProfit": gross_profit_ttm,
+        "costOfRevenue": cost_of_revenue_ttm,
+        "grossMargins": gross_margin,
+        "researchAndDevelopment": rd_ttm,
+        "sellingGeneralAdministrative": sga_ttm,
+        "operatingIncome": operating_income_ttm,
+        "operatingMargins": operating_margin,
+        "ebitda": ebitda_ttm,
+        "depreciationAmortization": depreciation_ttm,
+        "interestExpense": interest_expense_ttm,
+        "pretaxIncome": pretax_income_ttm,
+        "incomeTaxExpense": tax_expense_ttm,
+        "effectiveTaxRate": effective_tax_rate,
+        "netIncome": net_income_ttm,
+        "profitMargins": net_margin,
+        "basicEps": eps_basic_ttm,
+        "dilutedEps": eps_diluted_ttm,
+        "latestQuarterRevenue": latest_quarter_revenue,
+        "latestQuarterGrossProfit": latest_quarter_gross_profit,
+        "latestQuarterCostOfRevenue": latest_quarter_cost_of_revenue,
+        "latestQuarterGrossMargins": latest_quarter_gross_margin,
+        "latestQuarterResearchAndDevelopment": latest_quarter_rd,
+        "latestQuarterSellingGeneralAdministrative": latest_quarter_sga,
+        "latestQuarterOperatingIncome": latest_quarter_operating_income,
+        "latestQuarterOperatingMargins": latest_quarter_operating_margin,
+        "latestQuarterInterestExpense": latest_quarter_interest_expense,
+        "latestQuarterPretaxIncome": latest_quarter_pretax_income,
+        "latestQuarterIncomeTaxExpense": latest_quarter_tax_expense,
+        "latestQuarterNetIncome": latest_quarter_net_income,
+        "latestQuarterProfitMargins": latest_quarter_net_margin,
+        "latestQuarterBasicEps": latest_quarter_eps_basic,
+        "latestQuarterDilutedEps": latest_quarter_eps_diluted,
+        "operatingCashflow": operating_cash_flow_ttm,
+        "capitalExpenditures": capex_ttm,
+        "freeCashflow": free_cash_flow,
+        "freeCashFlowMargin": fcf_margin,
+        "totalCash": cash,
+        "shortTermDebt": short_debt,
+        "longTermDebt": long_debt,
+        "totalDebt": total_debt,
+        "totalAssets": total_assets,
+        "currentAssets": current_assets,
+        "totalLiabilities": total_liabilities,
+        "currentLiabilities": current_liabilities,
+        "stockholdersEquity": stockholders_equity,
+        "retainedEarnings": retained_earnings,
+        "inventory": inventory,
+        "accountsReceivable": receivables,
+        "accountsPayable": payables,
+        "currentRatio": current_ratio,
+        "debtToEquity": debt_to_equity,
+        "returnOnAssets": return_on_assets,
+        "returnOnEquity": return_on_equity,
+        "sharesOutstanding": shares,
+        "minorityInterest": minority_interest,
+        "totalInvestments": investments,
+    }
 
 
 def clean_history(history: pd.DataFrame | None) -> pd.DataFrame:
@@ -854,6 +1458,16 @@ def fetch_fundamentals_snapshot(ticker: str) -> dict:
 
     if current_volume == FUNDAMENTAL_NA and history is not None and not history.empty and "Volume" in history.columns:
         current_volume = safe_float(history["Volume"].dropna().iloc[-1]) if not history["Volume"].dropna().empty else FUNDAMENTAL_NA
+    if history is not None and not history.empty:
+        close_values = history["Close"].dropna() if "Close" in history.columns else pd.Series(dtype=float)
+        high_values = history["High"].dropna() if "High" in history.columns else pd.Series(dtype=float)
+        low_values = history["Low"].dropna() if "Low" in history.columns else pd.Series(dtype=float)
+        if not close_values.empty:
+            current_price = safe_float(close_values.iloc[-1]) or current_price
+        if not high_values.empty:
+            fifty_two_week_high = safe_float(high_values.tail(252).max()) or fifty_two_week_high
+        if not low_values.empty:
+            fifty_two_week_low = safe_float(low_values.tail(252).min()) or fifty_two_week_low
 
     snapshot = {
         "Company Profile": {
@@ -969,8 +1583,8 @@ def fetch_fundamentals_snapshot(ticker: str) -> dict:
         "Performance / Risk Snapshot": {
             "52 Week High": fifty_two_week_high,
             "52 Week Low": fifty_two_week_low,
-            "Distance From 52W High %": value_or_na(calculate_target_mean_upside(fifty_two_week_high, current_price)),
-            "Distance From 52W Low %": value_or_na(calculate_target_mean_upside(fifty_two_week_low, current_price)),
+            "Distance From 52W High %": value_or_na(calculate_distance_from_level(current_price, fifty_two_week_high)),
+            "Distance From 52W Low %": value_or_na(calculate_distance_from_level(current_price, fifty_two_week_low)),
             "Beta": safe_get_fundamental(info, ("beta",)),
             "Average Volume": average_volume,
             "10-Day Average Volume": ten_day_average_volume,

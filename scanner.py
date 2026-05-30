@@ -308,6 +308,54 @@ def build_snapshot_row(stock_data: dict, score_data: dict, setup_quality: dict |
     }
 
 
+def build_lightweight_score_data(stock_data: dict) -> dict:
+    return {
+        "signal_score": 0.0,
+        "label": "Unscored",
+        "base_score": 0.0,
+        "trigger_score": 0.0,
+        "follow_through_score": 0.0,
+        "risk_score": 0.0,
+        "historical_score": 50.0,
+        "historical_confidence": "N/A",
+        "historical_summary": "Deep scoring skipped by fast full-market snapshot refresh.",
+        "active_reaction_event": None,
+        "best_reaction_event": None,
+        "historical_stats": {},
+        "penalty_score": 0.0,
+        "tags": [],
+        "raw_tags": [],
+        "metrics": {},
+        "explanation": [],
+    }
+
+
+def build_lightweight_setup_quality() -> dict:
+    return {
+        "setup_type": "Not Deep Scored",
+        "a_plus_status": "N/A",
+        "a_plus_qualified": False,
+        "setup_signal_score": 0.0,
+        "market_regime": "N/A",
+        "trend_quality": None,
+        "base_quality": None,
+        "compression_quality": None,
+        "trigger_quality": None,
+        "risk_reward_quality": None,
+        "historical_edge": None,
+        "historical_hit_rate": None,
+        "historical_sample_size": None,
+        "historical_confidence": "N/A",
+        "historical_event_type": None,
+        "suggested_pivot": None,
+        "suggested_stop": None,
+        "risk_pct": None,
+        "reward_risk": None,
+        "close_strength": None,
+        "a_plus_explanation": "Deep setup scoring skipped by fast full-market snapshot refresh.",
+    }
+
+
 def safe_pct_distance(price: object, moving_average: object) -> float | None:
     try:
         price_value = float(price)
@@ -800,7 +848,8 @@ def passes_prefilter(
     if price is None:
         return False, 0.0, "missing_price"
 
-    min_price_value = min_price if min_price is not None else config.get("min_price", 0)
+    min_price_value = min_price if min_price is not None else config.get("min_price")
+    min_price_value = 0.0 if min_price_value is None else min_price_value
     if price < min_price_value:
         return False, 0.0, "price"
     if max_price is not None and price > max_price:
@@ -810,7 +859,8 @@ def passes_prefilter(
     if min_avg_volume is not None and avg_volume < min_avg_volume:
         return False, 0.0, "avg_volume"
 
-    min_addv_value = min_dollar_volume if min_dollar_volume is not None else config.get("min_addv", 0)
+    min_addv_value = min_dollar_volume if min_dollar_volume is not None else config.get("min_addv")
+    min_addv_value = 0.0 if min_addv_value is None else min_addv_value
     addv = safe_number(stock_data.get("addv_20")) or 0.0
     if addv < min_addv_value:
         return False, 0.0, "dollar_volume"
@@ -1730,10 +1780,11 @@ def refresh_scanner_snapshot(
     download_start = perf_counter()
     stock_data_map = {}
     failure_reasons = {}
-    ticker_chunks = chunk_tickers(tuple(tickers))
+    download_chunk_size = 50 if full_market_scan else 75
+    ticker_chunks = chunk_tickers(tuple(tickers), chunk_size=download_chunk_size)
     for chunk_index, ticker_chunk in enumerate(ticker_chunks, start=1):
         if progress_callback:
-            completed_before_chunk = min((chunk_index - 1) * 75, len(tickers))
+            completed_before_chunk = min((chunk_index - 1) * download_chunk_size, len(tickers))
             progress_callback(
                 completed_before_chunk,
                 len(tickers),
@@ -1742,6 +1793,31 @@ def refresh_scanner_snapshot(
         chunk_payload = get_batch_stock_data_chunk_detailed(ticker_chunk, period="2y", min_history_bars=200)
         stock_data_map.update(chunk_payload.get("data", {}))
         failure_reasons.update(chunk_payload.get("failures", {}))
+
+    retry_start = perf_counter()
+    retry_tickers = [
+        ticker
+        for ticker in tickers
+        if ticker not in stock_data_map and failure_reasons.get(ticker) == "failed/no data"
+    ]
+    retry_recovered_count = 0
+    if retry_tickers:
+        retry_chunks = chunk_tickers(tuple(retry_tickers), chunk_size=10)
+        for retry_index, retry_chunk in enumerate(retry_chunks, start=1):
+            if progress_callback:
+                progress_callback(
+                    len(tickers) - len(retry_tickers) + min((retry_index - 1) * 10, len(retry_tickers)),
+                    len(tickers),
+                    f"Retrying missing Yahoo data {retry_index}/{len(retry_chunks)}...",
+                )
+            retry_payload = get_batch_stock_data_chunk_detailed(retry_chunk, period="2y", min_history_bars=200)
+            retry_data = retry_payload.get("data", {})
+            retry_recovered_count += len(retry_data)
+            stock_data_map.update(retry_data)
+            failure_reasons.update(retry_payload.get("failures", {}))
+            for recovered_ticker in retry_data:
+                failure_reasons.pop(recovered_ticker, None)
+    retry_seconds = perf_counter() - retry_start
     download_seconds = perf_counter() - download_start
     failed_tickers = [ticker for ticker in tickers if ticker not in stock_data_map]
     valid_items = [(ticker, stock_data_map[ticker]) for ticker in tickers if ticker in stock_data_map]
@@ -1753,22 +1829,48 @@ def refresh_scanner_snapshot(
         progress_callback(0, len(valid_items), f"Calculating scanner scores 0/{len(valid_items)}...")
     benchmark_history = get_benchmark_history()
     market_regime = calculate_market_regime(get_market_regime_histories())
+    prefilter_start = perf_counter()
+    if full_market_scan:
+        deep_score_limit = get_scan_mode_config(scan_mode).get("candidate_limit") or 1000
+        deep_score_candidates, prefilter_meta = select_candidates_for_full_scoring(
+            stock_data_map=stock_data_map,
+            tickers=tickers,
+            config=config,
+            scan_mode=scan_mode or "Fast Scan",
+            candidate_limit=max(int(deep_score_limit), 1000),
+            bypass_prefilter=False,
+        )
+        deep_score_tickers = {ticker for ticker, _stock_data in deep_score_candidates}
+    else:
+        prefilter_meta = {
+            "valid_data_count": len(stock_data_map),
+            "prefilter_pass_count": len(stock_data_map),
+            "prefilter_scored_count": len(stock_data_map),
+            "prefilter_skip_reasons": {},
+        }
+        deep_score_tickers = set(stock_data_map)
+    prefilter_seconds = perf_counter() - prefilter_start
     rows = []
 
     def score_snapshot_row(ticker: str, stock_data: dict) -> dict | None:
-        score_data = calculate_signal_score(
-            stock_data=stock_data,
-            benchmark_history=benchmark_history,
-            min_addv=config.get("min_addv"),
-            calculate_historical_edge=calculate_historical_edge,
-        )
-        setup_quality = calculate_setup_quality(
-            stock_data.get("history"),
-            market_regime=market_regime,
-            addv_20=stock_data.get("addv_20"),
-            calculate_edge=calculate_historical_edge,
-        )
+        if ticker in deep_score_tickers:
+            score_data = calculate_signal_score(
+                stock_data=stock_data,
+                benchmark_history=benchmark_history,
+                min_addv=config.get("min_addv"),
+                calculate_historical_edge=calculate_historical_edge,
+            )
+            setup_quality = calculate_setup_quality(
+                stock_data.get("history"),
+                market_regime=market_regime,
+                addv_20=stock_data.get("addv_20"),
+                calculate_edge=calculate_historical_edge,
+            )
+        else:
+            score_data = build_lightweight_score_data(stock_data)
+            setup_quality = build_lightweight_setup_quality()
         row = build_snapshot_row(stock_data, score_data, setup_quality=setup_quality)
+        row["deep_scored"] = ticker in deep_score_tickers
         metadata = symbol_metadata.get(ticker, {})
         if metadata:
             row["company"] = metadata.get("company")
@@ -1819,15 +1921,19 @@ def refresh_scanner_snapshot(
         "not_enough_history_count": not_enough_history_count,
         "snapshot_build_failed_count": snapshot_build_failed_count,
         "usable_snapshot_count": len(snapshot_df.index),
+        "deep_scored_count": len(deep_score_tickers),
+        "lightweight_snapshot_count": max(len(snapshot_df.index) - len(deep_score_tickers), 0),
+        "retry_missing_data_count": len(retry_tickers),
+        "retry_recovered_count": retry_recovered_count,
         "failed_tickers": failed_tickers,
         "failure_reasons": failure_reasons,
         "duration_seconds": perf_counter() - start_time,
         "result_count": len(snapshot_df.index),
         "scan_mode": scan_mode or "Fast Scan",
-        "valid_data_count": len(stock_data_map),
-        "prefilter_pass_count": len(stock_data_map),
-        "prefilter_scored_count": len(stock_data_map),
-        "prefilter_skip_reasons": {},
+        "valid_data_count": prefilter_meta.get("valid_data_count", len(stock_data_map)),
+        "prefilter_pass_count": prefilter_meta.get("prefilter_pass_count", len(stock_data_map)),
+        "prefilter_scored_count": prefilter_meta.get("prefilter_scored_count", len(deep_score_tickers)),
+        "prefilter_skip_reasons": prefilter_meta.get("prefilter_skip_reasons", {}),
         "raw_symbols_loaded": universe_symbol_meta.get("raw_symbols_loaded"),
         "non_common_removed": universe_symbol_meta.get("non_common_removed"),
         "final_common_stocks": len(universe_tickers) if full_market_scan else universe_symbol_meta.get("final_common_stocks"),
@@ -1837,7 +1943,8 @@ def refresh_scanner_snapshot(
         "timings": {
             "universe_load_seconds": universe_seconds,
             "data_fetch_seconds": download_seconds,
-            "prefilter_seconds": 0,
+            "data_retry_seconds": retry_seconds,
+            "prefilter_seconds": prefilter_seconds,
             "scoring_seconds": scoring_seconds,
         },
     }

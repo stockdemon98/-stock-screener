@@ -39,6 +39,18 @@ def build_revenue_growth_path(
     return growth_rates
 
 
+def build_linear_path(start_value: float, end_value: float, projection_years: int) -> list[float]:
+    years = max(0, int(projection_years))
+    if years == 0:
+        return []
+    if years == 1:
+        return [end_value]
+    return [
+        start_value + (end_value - start_value) * ((year - 1) / (years - 1))
+        for year in range(1, years + 1)
+    ]
+
+
 def build_margin_path(
     current_margin: float,
     target_margin: float,
@@ -102,9 +114,12 @@ def calculate_fcff_forecast(
     high_growth_rate: float,
     fade_growth_rate: float,
     terminal_growth_rate: float,
+    high_growth_years: int,
     tax_rate: float,
     sales_to_capital_ratio: float,
+    terminal_sales_to_capital_ratio: float,
     wacc: float,
+    terminal_cost_of_capital: float,
     terminal_margin: float,
     terminal_roic: float,
     projection_years: int,
@@ -114,25 +129,34 @@ def calculate_fcff_forecast(
         fade_growth_rate,
         terminal_growth_rate,
         projection_years,
+        high_growth_years=high_growth_years,
     )
     margin_path = build_margin_path(current_margin, target_margin, years_to_target_margin, projection_years)
+    cost_of_capital_path = build_linear_path(wacc, terminal_cost_of_capital, projection_years)
+    sales_to_capital_path = build_linear_path(sales_to_capital_ratio, terminal_sales_to_capital_ratio, projection_years)
 
     rows: list[dict[str, float]] = []
     revenue = starting_revenue
     pv_explicit_fcff = 0.0
+    cumulative_discount_factor = 1.0
 
     for index, growth_rate in enumerate(growth_path, start=1):
         prior_revenue = revenue
         revenue = prior_revenue * (1 + growth_rate)
         revenue_change = revenue - prior_revenue
         operating_margin = margin_path[index - 1]
+        cost_of_capital = cost_of_capital_path[index - 1]
+        sales_to_capital = sales_to_capital_path[index - 1]
         ebit = revenue * operating_margin
         nopat = ebit * (1 - tax_rate)
-        reinvestment = revenue_change / sales_to_capital_ratio
+        reinvestment = revenue_change / sales_to_capital
         fcff = nopat - reinvestment
-        discount_factor = (1 + wacc) ** index
-        pv_fcff = fcff / discount_factor
+        cumulative_discount_factor /= 1 + cost_of_capital
+        pv_fcff = fcff * cumulative_discount_factor
         pv_explicit_fcff += pv_fcff
+        reinvestment_rate = reinvestment / nopat if nopat not in (None, 0) else None
+        invested_capital = revenue / sales_to_capital if sales_to_capital else None
+        roic = nopat / invested_capital if invested_capital not in (None, 0) else None
 
         rows.append(
             {
@@ -143,7 +167,13 @@ def calculate_fcff_forecast(
                 "EBIT": ebit,
                 "NOPAT": nopat,
                 "Reinvestment": reinvestment,
+                "Reinvestment Rate": reinvestment_rate,
                 "FCFF": fcff,
+                "Sales-to-Capital": sales_to_capital,
+                "Invested Capital": invested_capital,
+                "ROIC": roic,
+                "Cost of Capital": cost_of_capital,
+                "Discount Factor": cumulative_discount_factor,
                 "PV FCFF": pv_fcff,
             }
         )
@@ -155,11 +185,11 @@ def calculate_fcff_forecast(
         tax_rate,
         terminal_growth_rate,
         terminal_roic,
-        wacc,
+        terminal_cost_of_capital,
     )
     terminal_value = terminal.get("terminal_value")
     pv_terminal_value = (
-        terminal_value / ((1 + wacc) ** projection_years)
+        terminal_value * cumulative_discount_factor
         if terminal_value is not None and projection_years > 0
         else None
     )
@@ -206,11 +236,14 @@ class DcfAssumptions:
     investments: float
     high_growth_rate: float
     fade_growth_rate: float
+    high_growth_years: int
     target_operating_margin: float
     years_to_target_margin: int
     projection_years: int
     sales_to_capital_ratio: float
+    terminal_sales_to_capital_ratio: float
     wacc: float
+    terminal_cost_of_capital: float
     terminal_growth_rate: float
     terminal_operating_margin: float
     terminal_roic: float
@@ -225,10 +258,16 @@ def validate_assumptions(assumptions: DcfAssumptions) -> list[str]:
         warnings.append("Diluted shares outstanding are missing or invalid; fair value per share cannot be calculated.")
     if assumptions.sales_to_capital_ratio <= 0:
         warnings.append("Sales-to-capital ratio must be greater than zero.")
-    if assumptions.wacc <= assumptions.terminal_growth_rate:
-        warnings.append("WACC must be greater than terminal growth.")
+    if assumptions.terminal_sales_to_capital_ratio <= 0:
+        warnings.append("Terminal sales-to-capital ratio must be greater than zero.")
+    if assumptions.wacc <= 0:
+        warnings.append("Starting WACC must be greater than zero.")
+    if assumptions.terminal_cost_of_capital <= assumptions.terminal_growth_rate:
+        warnings.append("Terminal cost of capital must be greater than terminal growth.")
     if assumptions.terminal_roic <= assumptions.terminal_growth_rate:
         warnings.append("Terminal ROIC must be greater than terminal growth.")
+    if assumptions.terminal_growth_rate > assumptions.terminal_cost_of_capital:
+        warnings.append("Terminal growth cannot exceed terminal cost of capital.")
     if assumptions.current_operating_margin < 0:
         warnings.append("Current operating margin is negative; the valuation may be unreliable.")
     if assumptions.terminal_growth_rate > 0.04:
@@ -241,7 +280,7 @@ def calculate_damodaran_dcf(assumptions: DcfAssumptions) -> dict[str, Any]:
     blocking_errors = [
         warning
         for warning in warnings
-        if warning.startswith(("Revenue", "Diluted shares", "Sales-to-capital", "WACC", "Terminal ROIC"))
+        if warning.startswith(("Revenue", "Diluted shares", "Sales-to-capital", "Terminal sales", "Starting WACC", "Terminal cost", "Terminal ROIC"))
     ]
     if blocking_errors:
         return {"ok": False, "warnings": warnings}
@@ -254,9 +293,12 @@ def calculate_damodaran_dcf(assumptions: DcfAssumptions) -> dict[str, Any]:
         high_growth_rate=assumptions.high_growth_rate,
         fade_growth_rate=assumptions.fade_growth_rate,
         terminal_growth_rate=assumptions.terminal_growth_rate,
+        high_growth_years=assumptions.high_growth_years,
         tax_rate=assumptions.tax_rate,
         sales_to_capital_ratio=assumptions.sales_to_capital_ratio,
+        terminal_sales_to_capital_ratio=assumptions.terminal_sales_to_capital_ratio,
         wacc=assumptions.wacc,
+        terminal_cost_of_capital=assumptions.terminal_cost_of_capital,
         terminal_margin=assumptions.terminal_operating_margin,
         terminal_roic=assumptions.terminal_roic,
         projection_years=assumptions.projection_years,
@@ -307,38 +349,46 @@ def calculate_scenarios(assumptions: DcfAssumptions) -> list[dict[str, Any]]:
             max(-0.20, assumptions.high_growth_rate - 0.03),
             max(-0.20, assumptions.target_operating_margin - 0.03),
             assumptions.wacc + 0.01,
+            assumptions.terminal_cost_of_capital + 0.005,
             max(0.0, assumptions.terminal_growth_rate - 0.005),
             max(0.5, assumptions.sales_to_capital_ratio * 0.85),
+            max(0.5, assumptions.terminal_sales_to_capital_ratio * 0.90),
         ),
         (
             "Base",
             assumptions.high_growth_rate,
             assumptions.target_operating_margin,
             assumptions.wacc,
+            assumptions.terminal_cost_of_capital,
             assumptions.terminal_growth_rate,
             assumptions.sales_to_capital_ratio,
+            assumptions.terminal_sales_to_capital_ratio,
         ),
         (
             "Bull",
             assumptions.high_growth_rate + 0.03,
             assumptions.target_operating_margin + 0.03,
             max(0.01, assumptions.wacc - 0.005),
-            min(assumptions.wacc - 0.005, assumptions.terminal_growth_rate + 0.005),
+            max(0.01, assumptions.terminal_cost_of_capital - 0.005),
+            min(assumptions.terminal_cost_of_capital - 0.005, assumptions.terminal_growth_rate + 0.005),
             assumptions.sales_to_capital_ratio * 1.15,
+            assumptions.terminal_sales_to_capital_ratio * 1.10,
         ),
     ]
 
     rows: list[dict[str, Any]] = []
-    for name, growth, margin, wacc, terminal_growth, sales_to_capital in scenario_inputs:
+    for name, growth, margin, wacc, terminal_wacc, terminal_growth, sales_to_capital, terminal_sales_to_capital in scenario_inputs:
         scenario = DcfAssumptions(
             **{
                 **assumptions.__dict__,
                 "high_growth_rate": growth,
                 "target_operating_margin": margin,
                 "wacc": wacc,
+                "terminal_cost_of_capital": max(terminal_wacc, terminal_growth + 0.005),
                 "terminal_growth_rate": terminal_growth,
                 "terminal_roic": max(assumptions.terminal_roic, terminal_growth + 0.01),
                 "sales_to_capital_ratio": sales_to_capital,
+                "terminal_sales_to_capital_ratio": terminal_sales_to_capital,
             }
         )
         result = calculate_damodaran_dcf(scenario)
@@ -348,8 +398,10 @@ def calculate_scenarios(assumptions: DcfAssumptions) -> list[dict[str, Any]]:
                 "Revenue CAGR": growth,
                 "Target Operating Margin": margin,
                 "WACC": wacc,
+                "Terminal WACC": scenario.terminal_cost_of_capital,
                 "Terminal Growth": terminal_growth,
                 "Sales-to-Capital": sales_to_capital,
+                "Mature Sales-to-Capital": terminal_sales_to_capital,
                 "Fair Value / Share": result.get("fair_value_per_share"),
                 "Current Price": assumptions.current_price,
                 "Upside / Downside": result.get("upside_downside"),
@@ -383,6 +435,7 @@ def build_sensitivity_table(
                 **{
                     **assumptions.__dict__,
                     "wacc": row_wacc,
+                    "terminal_cost_of_capital": max(row_wacc, terminal_growth + 0.005),
                     "terminal_growth_rate": terminal_growth,
                     "terminal_roic": max(assumptions.terminal_roic, terminal_growth + 0.01),
                 }

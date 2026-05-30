@@ -1,16 +1,17 @@
 from datetime import date, datetime
 from html import escape
+import re
 
 import streamlit as st
 
 from charts import build_technical_readout
-from data_fetch import get_default_wacc_inputs
+from data_fetch import build_fundamental_quality_summary, get_default_wacc_inputs, get_sec_dcf_inputs
 from dcf import DcfAssumptions, build_sensitivity_table, calculate_damodaran_dcf, calculate_scenarios, safe_float
 from scoring import get_score_explanation
 from scanner import SCAN_MODE_CONFIG, get_scan_mode_default_limit
 from symbol_universe import EX_MAJOR_INDEXES_UNIVERSE, FULL_MARKET_UNIVERSE, get_symbol_metadata
 from ticker_lookup import build_ticker_lookup, ticker_from_option
-from universes import get_universe_label, get_universe_note, get_universe_option_label, get_universe_warning, is_universe_available
+from universes import get_universe_count, get_universe_label, get_universe_note, get_universe_option_label, get_universe_warning, is_universe_available
 from utils import format_change_pct, format_price, format_section_rows
 
 
@@ -420,6 +421,9 @@ def render_technical_metric_explanations() -> None:
 def get_default_ticker_limit(universe_name: str, scan_mode: str = "Fast Scan") -> int:
     if str(universe_name).strip().upper() in {FULL_MARKET_UNIVERSE, EX_MAJOR_INDEXES_UNIVERSE}:
         return 0
+    universe_count = get_universe_count(universe_name)
+    if universe_count:
+        return universe_count
     return get_scan_mode_default_limit(scan_mode)
 
 
@@ -576,59 +580,77 @@ def render_controls(universe_names: list[str]) -> tuple[str, int, int, int, str,
 
     min_score = 0
     st.markdown("### Scanner Controls")
-    col1, col2, col3, col4 = st.columns([1.1, 1.1, 1.0, 1.6])
+    col1, col2, col3 = st.columns([1.1, 1.1, 1.8])
     with col1:
         max_results = st.slider("Max results", min_value=3, max_value=50, value=10, step=1)
     with col2:
         if is_full_market:
-            st.caption("Max tickers to scan: all common stocks")
+            st.caption("Universe size: all common stocks")
             max_tickers = 0
         else:
+            universe_count = get_universe_count(selected_universe)
+            default_ticker_limit = get_default_ticker_limit(selected_universe, scan_mode)
+            max_ticker_slider_value = max(10, universe_count or 2000)
+            ticker_slider_key = f"max-tickers-{selected_universe}-{scan_mode}"
+            if st.session_state.get("last_max_ticker_universe") != selected_universe:
+                st.session_state[ticker_slider_key] = min(default_ticker_limit, max_ticker_slider_value)
+                st.session_state["last_max_ticker_universe"] = selected_universe
             max_tickers = st.slider(
                 "Max tickers to scan",
                 min_value=10,
-                max_value=2000,
-                value=get_default_ticker_limit(selected_universe, scan_mode),
-                step=10,
-                key=f"max-tickers-{selected_universe}-{scan_mode}",
+                max_value=max_ticker_slider_value,
+                value=min(default_ticker_limit, max_ticker_slider_value),
+                step=1,
+                key=ticker_slider_key,
                 help="Caps how many tickers are included in the snapshot scan.",
             )
     with col3:
-        run_scan = st.button("Load Latest Full Snapshot" if is_full_market else "Run Scan", type="primary", disabled=not is_universe_available(selected_universe))
-        st.caption("Loads the latest saved full-market snapshot." if is_full_market else "Runs the scanner using the latest saved snapshot. Use this after adjusting filters like price range, max results, or trigger settings.")
-    with col4:
-        run_full_live = False
-        if is_full_market:
-            run_full_live = st.button("Run Full Live Scan", disabled=not is_universe_available(selected_universe))
+        run_label = "Show Saved Results" if is_full_market else "Show Results"
+        refresh_label = "Update Full-Market Data" if is_full_market else "Update Market Data"
+        run_scan = st.button(run_label, type="primary", disabled=not is_universe_available(selected_universe))
         refresh_snapshot = st.button(
-            "Refresh Full Snapshot" if is_full_market else "Refresh Market Data / Build Snapshot",
+            refresh_label,
             disabled=not is_universe_available(selected_universe),
         )
-        refresh_snapshot = bool(refresh_snapshot or run_full_live)
-        st.caption("Downloads all full-market common-stock data and saves a local snapshot." if is_full_market else "Downloads fresh market data for the selected universe and saves a snapshot. Use this when changing universe or refreshing prices.")
+        if is_full_market:
+            st.caption("Show Saved Results is fast. Update Full-Market Data downloads every common stock and can take several minutes.")
+        else:
+            st.caption("Show Results uses the saved snapshot. Update Market Data downloads fresh prices and rebuilds it.")
 
-    st.markdown("### Ranking Style")
-    st.caption(
-        "Ranking Style controls how the scanner scores and orders the stocks found by the search above. "
-        "It does not replace the breakout search filters - it decides which matching stocks look like the "
-        "highest-quality swing setups."
-    )
-    st.caption("Example: Breakout Search finds the stocks. Ranking Style decides which ones look best.")
-    setup_mode = st.selectbox(
-        "Rank results by",
-        ["Main Trend Scanner", "A+ Setup Mode", "Breakout Retests", "Pre-Breakout Watchlist", "Fresh Breakouts"],
+    st.markdown("### Results View")
+    setup_view_labels = [
+        "All Trend Setups",
+        "Best A+ Setups",
+        "Fresh Breakouts",
+        "Breakout Retests",
+        "Pre-Breakout Bases",
+    ]
+    setup_view_to_mode = {
+        "All Trend Setups": "Main Trend Scanner",
+        "Best A+ Setups": "A+ Setup Mode",
+        "Fresh Breakouts": "Fresh Breakouts",
+        "Breakout Retests": "Breakout Retests",
+        "Pre-Breakout Bases": "Pre-Breakout Watchlist",
+    }
+    selected_setup_view = st.selectbox(
+        "Show",
+        setup_view_labels,
         index=0,
-        key="setup-mode",
+        key="results-view",
         help="Filters the saved snapshot by setup type and quality.",
     )
+    setup_mode = setup_view_to_mode[selected_setup_view]
     setup_descriptions = {
-        "A+ Setup Mode": "A+ Setup Mode only shows higher-quality long setups where trend, base structure, risk/reward, market regime, and trigger quality are aligned. This mode is stricter and may return fewer stocks.",
-        "Breakout Retests": "Breakout Retest looks for stocks that already broke out, pulled back toward the breakout area, and are trying to hold support. This can produce cleaner entries than chasing the first breakout candle.",
-        "Pre-Breakout Watchlist": "Pre-Breakout Watchlist finds stocks building tight bases below resistance. These are not confirmed breakouts yet. They are watchlist names that may trigger if price closes above the pivot with volume.",
+        "All Trend Setups": "All Trend Setups shows the broader long-only trend scanner results from the saved snapshot.",
+        "Best A+ Setups": "Best A+ Setups only shows higher-quality long setups where trend, base structure, risk/reward, market regime, and trigger quality are aligned. This mode is stricter and may return fewer stocks.",
         "Fresh Breakouts": "Fresh Breakouts finds stocks breaking above recent resistance. Stronger breakouts close near the day's high, happen on above-average volume, and occur in a supportive market regime.",
-        "Main Trend Scanner": "Shows the broader long-only trend scanner results from the saved snapshot.",
+        "Breakout Retests": "Breakout Retest looks for stocks that already broke out, pulled back toward the breakout area, and are trying to hold support. This can produce cleaner entries than chasing the first breakout candle.",
+        "Pre-Breakout Bases": "Pre-Breakout Bases finds stocks building tight bases below resistance. These are not confirmed breakouts yet. They are watchlist names that may trigger if price closes above the pivot with volume.",
     }
-    st.caption(setup_descriptions.get(setup_mode, ""))
+    st.caption(setup_descriptions.get(selected_setup_view, ""))
+    with st.expander("Results View Guide", expanded=False):
+        for label in setup_view_labels:
+            st.markdown(f"**{label}:** {setup_descriptions[label]}")
     calculate_historical_edge = st.checkbox(
         "Calculate Historical Edge",
         value=False,
@@ -868,6 +890,20 @@ def render_scan_summary(scan_results: dict) -> None:
                 f"Skipped {skipped_total} tickers due to missing or invalid data."
             )
         )
+        if meta.get("retry_missing_data_count"):
+            st.caption(
+                (
+                    f"Missing-data retry attempted: {meta.get('retry_missing_data_count', 0)} | "
+                    f"Recovered on retry: {meta.get('retry_recovered_count', 0)}"
+                )
+            )
+        if meta.get("deep_scored_count"):
+            st.caption(
+                (
+                    f"Deep-scored candidates: {meta.get('deep_scored_count', 0)} | "
+                    f"Lightweight snapshot rows: {meta.get('lightweight_snapshot_count', 0)}"
+                )
+            )
     timings = meta.get("timings", {})
     if timings:
         if "filter_sort_seconds" in timings or "snapshot_load_seconds" in timings:
@@ -1134,14 +1170,7 @@ def render_setup_quality_table(title: str, rows: list[dict], key_prefix: str) ->
 
 def render_trigger_scan_controls() -> tuple[list[str], str, int, int, int, bool, int, bool, bool, bool]:
     st.markdown("### Trigger Scan")
-    st.caption(
-        "Trigger Scan searches for recent moving-average reclaim events. By default it shows one clean result per "
-        "ticker using the freshest and highest-priority trigger, so older duplicate signals do not clutter the scan."
-    )
-    st.caption(
-        "Trigger age band filters results by when the moving-average trigger actually happened. This avoids showing "
-        "the same recent stock in every longer lookback window."
-    )
+    st.caption("Finds stocks that recently reclaimed key moving averages or printed a major moving-average cross.")
 
     event_options = [
         "Crossed above EMA8",
@@ -1152,6 +1181,15 @@ def render_trigger_scan_controls() -> tuple[list[str], str, int, int, int, bool,
         "Golden Cross: SMA50 crossed above SMA200",
         "Death Cross: SMA50 crossed below SMA200",
     ]
+    event_display_labels = {
+        "Crossed above EMA8": "EMA8 reclaim",
+        "Crossed above EMA21": "EMA21 reclaim",
+        "Crossed above SMA50": "SMA50 reclaim",
+        "Crossed above SMA100": "SMA100 reclaim",
+        "Crossed above SMA200": "SMA200 reclaim",
+        "Golden Cross: SMA50 crossed above SMA200": "Golden cross",
+        "Death Cross: SMA50 crossed below SMA200": "Death cross",
+    }
     age_band_by_label = {
         "0-1 weeks ago": (0, 5),
         "1-2 weeks ago": (6, 10),
@@ -1164,7 +1202,7 @@ def render_trigger_scan_controls() -> tuple[list[str], str, int, int, int, bool,
     col1, col2, col3 = st.columns([2.0, 1.1, 1.4])
     with col1:
         selected_events = st.multiselect(
-            "Event type",
+            "Triggers to find",
             event_options,
             default=[
                 "Crossed above EMA21",
@@ -1173,11 +1211,12 @@ def render_trigger_scan_controls() -> tuple[list[str], str, int, int, int, bool,
                 "Golden Cross: SMA50 crossed above SMA200",
             ],
             key="trigger-event-types",
+            format_func=lambda option: event_display_labels.get(option, option),
         )
     with col2:
-        age_band_label = st.selectbox("Trigger age band", list(age_band_by_label), index=1, key="trigger-age-band")
+        age_band_label = st.selectbox("When it happened", list(age_band_by_label), index=1, key="trigger-age-band")
         max_trigger_results = st.slider(
-            "Max trigger results",
+            "Max results",
             min_value=5,
             max_value=100,
             value=25,
@@ -1186,13 +1225,24 @@ def render_trigger_scan_controls() -> tuple[list[str], str, int, int, int, bool,
         )
     with col3:
         only_current = st.checkbox(
-            "Only show stocks currently above EMA21 and SMA50",
+            "Still above EMA21 and SMA50",
             value=True,
             key="trigger-only-current-above",
         )
         one_row_per_ticker = st.checkbox("One row per ticker", value=True, key="trigger-one-row-per-ticker")
-        show_all_trigger_events = st.checkbox("Show all trigger events", value=False, key="trigger-show-all-events")
+        show_all_trigger_events = st.checkbox("Show duplicate triggers", value=False, key="trigger-show-all-events")
         run_trigger_scan = st.button("Run Trigger Scan", type="secondary", key="trigger-run-scan")
+
+    with st.expander("Trigger Scan Guide", expanded=False):
+        st.markdown(
+            """
+Trigger Scan searches for recent moving-average reclaim events. A reclaim means price closed back above a selected moving average after previously closing below it.
+
+When it happened filters results by the actual trigger date. This avoids showing the same recent stock in every longer lookback window.
+
+One row per ticker keeps the list cleaner by showing the freshest and highest-priority trigger for each stock. Turn on duplicate triggers only when you want to inspect every signal.
+            """
+        )
 
     effective_one_row_per_ticker = one_row_per_ticker and not show_all_trigger_events
     min_days_ago, max_days_ago = age_band_by_label[age_band_label]
@@ -1265,21 +1315,7 @@ def render_trigger_scan_results(rows: list[dict] | None, scanner_filters: dict |
 
 def render_breakout_scan_controls() -> tuple[str, str, float, int, float, bool, float, int, bool]:
     st.markdown("### Breakout Search")
-    st.info(
-        (
-            "**What this search is doing**\n\n"
-            "This search looks for stocks showing breakout-style strength. It scans for names breaking above recent "
-            "20-day or 50-day highs, tightening near resistance, or starting to push out of a clean base. The goal is "
-            "to find long-only swing trade candidates that may be entering a new momentum phase, while avoiding stocks "
-            "that are already too extended above key moving averages.\n\n"
-            "Use the Breakout Condition controls to choose what type of breakout behavior to search for. Use Ranking "
-            "Style below to decide how matching stocks should be scored and ordered."
-        )
-    )
-    st.caption(
-        "Breakout Search finds stocks that are breaking above recent highs, building near resistance, or forming clean "
-        "breakout-style setups. These controls decide what type of breakout condition the scanner should look for."
-    )
+    st.caption("Finds stocks breaking out, setting up near resistance, or holding a recent breakout.")
 
     mode_options = {
         "Near Breakout": {
@@ -1310,7 +1346,7 @@ def render_breakout_scan_controls() -> tuple[str, str, float, int, float, bool, 
     col1, col2, col3 = st.columns([1.7, 1.1, 1.0])
     with col1:
         display_mode = st.selectbox(
-            "Breakout condition",
+            "Setup to find",
             list(mode_options),
             index=0,
             key="breakout-mode",
@@ -1322,19 +1358,30 @@ def render_breakout_scan_controls() -> tuple[str, str, float, int, float, bool, 
         default_use_relative_volume = mode_options[display_mode]["use_relative_volume"]
     with col2:
         resistance_lookback = st.selectbox(
-            "High to break above",
+            "Resistance level",
             ["20D high", "50D high", "Both"],
             index=2,
             key="breakout-resistance-lookback",
         )
     with col3:
         max_results = st.slider(
-            "Max breakout search results",
+            "Max results",
             min_value=5,
             max_value=100,
             value=25,
             step=5,
             key="breakout-max-results",
+        )
+
+    with st.expander("Breakout Search Guide", expanded=False):
+        st.markdown(
+            """
+Breakout Search looks for long-only swing candidates showing breakout-style strength.
+
+Near Breakout finds stocks close to resistance before the breakout. Breaking Out Now finds stocks that recently cleared a 20-day or 50-day high. Holding Breakout finds stocks that already broke out and are still holding strength.
+
+Resistance level controls whether the breakout is judged against the recent 20-day high, 50-day high, or either level.
+            """
         )
 
     max_distance_below_pct = 5.0
@@ -1391,7 +1438,7 @@ def render_breakout_scan_controls() -> tuple[str, str, float, int, float, bool, 
 
     action_col, note_col = st.columns([1.0, 3.0])
     with action_col:
-        run_breakout_scan = st.button("Run Breakout Search", type="secondary", key="breakout-run-scan")
+        run_breakout_scan = st.button("Search Breakouts", type="secondary", key="breakout-run-scan")
     with note_col:
         st.caption("Snapshot data is already downloaded. This scan only filters the saved snapshot and does not redownload market data.")
 
@@ -3710,10 +3757,35 @@ FUNDAMENTAL_SECTION_LABELS = {
 FUNDAMENTAL_MONEY_LABELS = {
     "Market Cap",
     "Enterprise Value",
+    "Revenue",
+    "Revenue (TTM)",
+    "Gross Profit (TTM)",
+    "Cost of Revenue (TTM)",
+    "R&D Expense (TTM)",
+    "SG&A Expense (TTM)",
+    "Operating Income",
+    "Operating Income (TTM)",
     "EBITDA",
+    "EBITDA (TTM)",
+    "D&A (TTM)",
+    "Interest Expense (TTM)",
+    "Pretax Income (TTM)",
+    "Income Tax Expense (TTM)",
     "Net Income",
+    "Net Income (TTM)",
     "Total Cash",
+    "Short-Term Debt",
+    "Long-Term Debt",
     "Total Debt",
+    "Total Assets",
+    "Current Assets",
+    "Total Liabilities",
+    "Current Liabilities",
+    "Stockholders Equity",
+    "Retained Earnings",
+    "Inventory",
+    "Accounts Receivable",
+    "Accounts Payable",
     "Operating Cash Flow",
     "Free Cash Flow",
     "Levered Free Cash Flow",
@@ -3721,6 +3793,16 @@ FUNDAMENTAL_MONEY_LABELS = {
     "Target High Price",
     "Target Mean Price",
     "Target Low Price",
+    "Latest Quarter Revenue",
+    "Latest Quarter Gross Profit",
+    "Latest Quarter Cost of Revenue",
+    "Latest Quarter R&D Expense",
+    "Latest Quarter SG&A Expense",
+    "Latest Quarter Operating Income",
+    "Latest Quarter Interest Expense",
+    "Latest Quarter Pretax Income",
+    "Latest Quarter Income Tax Expense",
+    "Latest Quarter Net Income",
     "52 Week High",
     "52 Week Low",
     "Net Income to Common",
@@ -3731,11 +3813,19 @@ FUNDAMENTAL_PERCENT_LABELS = {
     "Quarterly Revenue Growth YoY",
     "Quarterly Earnings Growth YoY",
     "Gross Margin",
+    "Gross Margin (TTM)",
+    "Latest Quarter Gross Margin",
     "Operating Margin",
+    "Operating Margin (TTM)",
+    "Latest Quarter Operating Margin",
     "Profit Margin",
+    "Net Margin (TTM)",
+    "Latest Quarter Net Margin",
     "EBITDA Margin",
     "Return on Equity",
     "Return on Assets",
+    "Effective Tax Rate (TTM)",
+    "Free Cash Flow Margin (TTM)",
     "Return on Invested Capital",
     "Free Cash Flow Yield",
     "Short Percent of Float",
@@ -3776,6 +3866,7 @@ FUNDAMENTAL_MULTIPLE_LABELS = {
 }
 FUNDAMENTAL_SHARE_LABELS = {
     "Shares Outstanding",
+    "Diluted Shares",
     "Float Shares",
     "Shares Short",
     "Implied Shares Outstanding",
@@ -3799,6 +3890,10 @@ FUNDAMENTAL_EPS_LABELS = {
     "EPS Estimate Next Quarter",
     "EPS Trailing Twelve Months",
     "EPS Forward",
+    "Basic EPS (TTM)",
+    "Diluted EPS (TTM)",
+    "Latest Quarter Basic EPS",
+    "Latest Quarter Diluted EPS",
 }
 FUNDAMENTAL_POSITIVE_LABELS = FUNDAMENTAL_PERCENT_LABELS | FUNDAMENTAL_SIGNED_PERCENT_LABELS
 
@@ -3851,7 +3946,7 @@ def format_eps(value: object) -> str:
 def format_fundamental_snapshot_value(section: str, label: str, value: object) -> str:
     value = normalize_snapshot_value(value)
     if value is None:
-        return "N/A"
+        return ""
     if label in FUNDAMENTAL_MONEY_LABELS:
         if label in {"Target High Price", "Target Mean Price", "Target Low Price", "52 Week High", "52 Week Low"}:
             return format_price(safe_numeric(value))
@@ -3876,7 +3971,7 @@ def format_fundamental_snapshot_value(section: str, label: str, value: object) -
 
 
 def get_snapshot_value_class(label: str, display_value: str) -> str:
-    if display_value == "N/A":
+    if display_value in {"", "N/A"}:
         return "fs-muted"
     numeric_value = safe_numeric(display_value.replace("%", "").replace("$", "").replace(",", "").rstrip("x"))
     if numeric_value is None:
@@ -3942,8 +4037,8 @@ def render_fundamentals_guide() -> None:
         ("Quarterly Earnings Growth YoY", "Most recent quarter's earnings growth compared with the same quarter last year."),
         ("Revenue Per Share", "Revenue divided by shares outstanding."),
         ("Net Income to Common", "Net income available to common shareholders."),
-        ("Gross Margin", "Revenue left after cost of goods sold."),
-        ("Operating Margin", "Profitability from core operations."),
+        ("Gross Margin", "Revenue left after cost of goods sold. SEC view labels whether it is trailing twelve months or latest quarter."),
+        ("Operating Margin", "Profitability from core operations. SEC view labels whether it is trailing twelve months or latest quarter."),
         ("Profit Margin", "Net income as a percentage of revenue."),
         ("ROE", "Return on shareholder equity."),
         ("Debt / Equity", "Debt compared with shareholder equity."),
@@ -3960,44 +4055,202 @@ def render_fundamentals_guide() -> None:
             st.caption(f"{label}: {description}")
 
 
-def render_simple_fundamentals_tab(fundamentals: dict, fundamentals_snapshot: dict | None = None) -> None:
-    snapshot = fundamentals_snapshot or {}
-    if not snapshot and not fundamentals:
+def get_yahoo_fallback_section(fundamentals_snapshot: dict | None, section_name: str) -> dict:
+    section = (fundamentals_snapshot or {}).get(section_name)
+    return section.copy() if isinstance(section, dict) else {}
+
+
+def build_sec_fundamentals_snapshot(sec_inputs: dict, fundamentals_snapshot: dict | None = None) -> dict:
+    snapshot = {
+        "Company Profile": {
+            "Company Name": sec_inputs.get("entity_name"),
+            "Financial Data Source": "SEC companyfacts XBRL",
+            "Latest SEC Period": sec_inputs.get("latest_period"),
+            "Latest SEC Filed": sec_inputs.get("latest_filed"),
+        },
+        "Valuation": get_yahoo_fallback_section(fundamentals_snapshot, "Valuation"),
+        "Income Statement - TTM": {
+            "Revenue (TTM)": sec_inputs.get("totalRevenue"),
+            "Gross Profit (TTM)": sec_inputs.get("grossProfit"),
+            "Cost of Revenue (TTM)": sec_inputs.get("costOfRevenue"),
+            "R&D Expense (TTM)": sec_inputs.get("researchAndDevelopment"),
+            "SG&A Expense (TTM)": sec_inputs.get("sellingGeneralAdministrative"),
+            "Operating Income (TTM)": sec_inputs.get("operatingIncome"),
+            "EBITDA (TTM)": sec_inputs.get("ebitda"),
+            "D&A (TTM)": sec_inputs.get("depreciationAmortization"),
+            "Interest Expense (TTM)": sec_inputs.get("interestExpense"),
+            "Pretax Income (TTM)": sec_inputs.get("pretaxIncome"),
+            "Income Tax Expense (TTM)": sec_inputs.get("incomeTaxExpense"),
+            "Net Income (TTM)": sec_inputs.get("netIncome"),
+            "Basic EPS (TTM)": sec_inputs.get("basicEps"),
+            "Diluted EPS (TTM)": sec_inputs.get("dilutedEps"),
+        },
+        "Income Statement - Latest Q": {
+            "Latest Quarter Revenue": sec_inputs.get("latestQuarterRevenue"),
+            "Latest Quarter Gross Profit": sec_inputs.get("latestQuarterGrossProfit"),
+            "Latest Quarter Cost of Revenue": sec_inputs.get("latestQuarterCostOfRevenue"),
+            "Latest Quarter R&D Expense": sec_inputs.get("latestQuarterResearchAndDevelopment"),
+            "Latest Quarter SG&A Expense": sec_inputs.get("latestQuarterSellingGeneralAdministrative"),
+            "Latest Quarter Operating Income": sec_inputs.get("latestQuarterOperatingIncome"),
+            "Latest Quarter Interest Expense": sec_inputs.get("latestQuarterInterestExpense"),
+            "Latest Quarter Pretax Income": sec_inputs.get("latestQuarterPretaxIncome"),
+            "Latest Quarter Income Tax Expense": sec_inputs.get("latestQuarterIncomeTaxExpense"),
+            "Latest Quarter Net Income": sec_inputs.get("latestQuarterNetIncome"),
+            "Latest Quarter Basic EPS": sec_inputs.get("latestQuarterBasicEps"),
+            "Latest Quarter Diluted EPS": sec_inputs.get("latestQuarterDilutedEps"),
+        },
+        "Margins / Returns": {
+            "Gross Margin (TTM)": sec_inputs.get("grossMargins"),
+            "Operating Margin (TTM)": sec_inputs.get("operatingMargins"),
+            "Net Margin (TTM)": sec_inputs.get("profitMargins"),
+            "Latest Quarter Gross Margin": sec_inputs.get("latestQuarterGrossMargins"),
+            "Latest Quarter Operating Margin": sec_inputs.get("latestQuarterOperatingMargins"),
+            "Latest Quarter Net Margin": sec_inputs.get("latestQuarterProfitMargins"),
+            "Effective Tax Rate (TTM)": sec_inputs.get("effectiveTaxRate"),
+            "Return on Assets": sec_inputs.get("returnOnAssets"),
+            "Return on Equity": sec_inputs.get("returnOnEquity"),
+            "Free Cash Flow Margin (TTM)": sec_inputs.get("freeCashFlowMargin"),
+        },
+        "Balance Sheet": {
+            "Total Cash": sec_inputs.get("totalCash"),
+            "Short-Term Debt": sec_inputs.get("shortTermDebt"),
+            "Long-Term Debt": sec_inputs.get("longTermDebt"),
+            "Total Debt": sec_inputs.get("totalDebt"),
+            "Total Assets": sec_inputs.get("totalAssets"),
+            "Current Assets": sec_inputs.get("currentAssets"),
+            "Total Liabilities": sec_inputs.get("totalLiabilities"),
+            "Current Liabilities": sec_inputs.get("currentLiabilities"),
+            "Stockholders Equity": sec_inputs.get("stockholdersEquity"),
+            "Retained Earnings": sec_inputs.get("retainedEarnings"),
+            "Inventory": sec_inputs.get("inventory"),
+            "Accounts Receivable": sec_inputs.get("accountsReceivable"),
+            "Accounts Payable": sec_inputs.get("accountsPayable"),
+            "Current Ratio": sec_inputs.get("currentRatio"),
+            "Debt / Equity": sec_inputs.get("debtToEquity"),
+        },
+        "Cash Flow": {
+            "Operating Cash Flow": sec_inputs.get("operatingCashflow"),
+            "CapEx": sec_inputs.get("capitalExpenditures"),
+            "Free Cash Flow": sec_inputs.get("freeCashflow"),
+        },
+        "Share Structure / Ownership": get_yahoo_fallback_section(fundamentals_snapshot, "Share Structure / Ownership"),
+        "Dividends": get_yahoo_fallback_section(fundamentals_snapshot, "Dividends"),
+        "Analyst / Target Info": get_yahoo_fallback_section(fundamentals_snapshot, "Analyst / Target Info"),
+        "Performance / Risk Snapshot": get_yahoo_fallback_section(fundamentals_snapshot, "Performance / Risk Snapshot"),
+    }
+    snapshot["__quality__"] = build_fundamental_quality_summary(snapshot)
+    return snapshot
+
+
+def build_yahoo_fundamentals_snapshot(fundamentals_snapshot: dict | None, fundamentals: dict) -> dict:
+    snapshot = {
+        section: values.copy() if isinstance(values, dict) else values
+        for section, values in (fundamentals_snapshot or {}).items()
+    }
+    if snapshot:
+        return snapshot
+
+    if not fundamentals:
+        return {}
+
+    snapshot = {
+        "Company Profile": {
+            "Company Name": fundamentals.get("longName") or fundamentals.get("shortName"),
+            "Sector": fundamentals.get("sector"),
+            "Industry": fundamentals.get("industry"),
+            "Country": fundamentals.get("country"),
+            "Exchange": fundamentals.get("exchange") or fundamentals.get("fullExchangeName"),
+            "Currency": fundamentals.get("currency") or fundamentals.get("financialCurrency"),
+        },
+        "Valuation": {
+            "Market Cap": fundamentals.get("marketCap"),
+            "Enterprise Value": fundamentals.get("enterpriseValue"),
+            "Forward P/E": fundamentals.get("forwardPE"),
+            "Price / Sales": fundamentals.get("priceToSalesTrailing12Months"),
+            "Price / Book": fundamentals.get("priceToBook"),
+        },
+        "Growth": {
+            "Revenue Growth": fundamentals.get("revenueGrowth"),
+            "Earnings Growth": fundamentals.get("earningsGrowth"),
+        },
+        "Profitability": {
+            "Gross Margin": fundamentals.get("grossMargins"),
+            "Operating Margin": fundamentals.get("operatingMargins"),
+            "Profit Margin": fundamentals.get("profitMargins"),
+            "Return on Equity": fundamentals.get("returnOnEquity"),
+        },
+        "Balance Sheet": {
+            "Total Cash": fundamentals.get("totalCash"),
+            "Total Debt": fundamentals.get("totalDebt"),
+            "Debt / Equity": fundamentals.get("debtToEquity"),
+            "Current Ratio": fundamentals.get("currentRatio"),
+        },
+        "Cash Flow": {
+            "Operating Cash Flow": fundamentals.get("operatingCashflow"),
+            "Free Cash Flow": fundamentals.get("freeCashflow"),
+        },
+        "Share Structure / Ownership": {
+            "Shares Outstanding": fundamentals.get("sharesOutstanding"),
+            "Float Shares": fundamentals.get("floatShares"),
+            "Short Percent of Float": fundamentals.get("shortPercentOfFloat"),
+        },
+    }
+    snapshot["__quality__"] = build_fundamental_quality_summary(snapshot)
+    return snapshot
+
+
+def apply_current_price_performance_overrides(snapshot: dict, detail_row: dict | None) -> dict:
+    current_price = safe_numeric((detail_row or {}).get("price"))
+    performance_snapshot = snapshot.get("Performance / Risk Snapshot")
+    if current_price is None or not isinstance(performance_snapshot, dict):
+        return snapshot
+
+    high_52w = safe_numeric(performance_snapshot.get("52 Week High"))
+    low_52w = safe_numeric(performance_snapshot.get("52 Week Low"))
+    if high_52w not in (None, 0):
+        performance_snapshot["Distance From 52W High %"] = (current_price / high_52w) - 1
+    if low_52w not in (None, 0):
+        performance_snapshot["Distance From 52W Low %"] = (current_price / low_52w) - 1
+    return snapshot
+
+
+def render_simple_fundamentals_tab(fundamentals: dict, fundamentals_snapshot: dict | None = None, detail_row: dict | None = None) -> None:
+    st.markdown("#### Fundamentals Snapshot")
+    ticker = str((detail_row or {}).get("ticker") or "").strip().upper()
+    sec_inputs = get_sec_dcf_inputs(ticker) if ticker else {}
+    sec_available = bool(sec_inputs.get("available"))
+    yahoo_available = bool(fundamentals_snapshot or fundamentals)
+    if not sec_available and not yahoo_available:
         st.info("No fundamentals available.")
         return
 
-    st.markdown("#### Fundamentals Snapshot")
-    st.caption(
-        "Fundamentals Snapshot summarizes valuation, growth, profitability, balance sheet strength, ownership, "
-        "dividends, analyst targets, and performance data from available Yahoo Finance fields. Missing fields are shown as N/A."
-    )
+    yahoo_snapshot = build_yahoo_fundamentals_snapshot(fundamentals_snapshot, fundamentals)
+    snapshot = build_sec_fundamentals_snapshot(sec_inputs, yahoo_snapshot) if sec_available else yahoo_snapshot
+    snapshot = apply_current_price_performance_overrides(snapshot, detail_row)
+    if sec_available:
+        st.caption(
+            (
+                f"SEC source: {sec_inputs.get('entity_name') or ticker} | "
+                f"Latest period: {sec_inputs.get('latest_period') or 'N/A'} | "
+                f"Filed: {sec_inputs.get('latest_filed') or 'N/A'} | "
+                f"TTM source periods: {', '.join(sec_inputs.get('source_periods') or []) or 'N/A'}"
+            )
+        )
+        st.caption(
+            "SEC statement values are filing-based. Yahoo only fills the market-style sections: Valuation, Share Structure / Ownership, Dividends, Analyst / Target Info, and Performance / Risk Snapshot."
+        )
+        st.caption("SEC values labeled TTM use current fiscal YTD plus prior fiscal year minus prior-year same YTD. Latest Q values use the latest standalone quarterly filing fact when available.")
+    else:
+        st.caption("Yahoo fills the available non-filing fields because SEC companyfacts were not available for this ticker.")
 
     if not snapshot:
-        snapshot = {
-            "Valuation": {
-                "Market Cap": fundamentals.get("marketCap"),
-                "Enterprise Value": fundamentals.get("enterpriseValue"),
-                "Forward P/E": fundamentals.get("forwardPE"),
-                "Price / Sales": fundamentals.get("priceToSalesTrailing12Months"),
-                "Price / Book": fundamentals.get("priceToBook"),
-            },
-            "Growth": {
-                "Revenue Growth": fundamentals.get("revenueGrowth"),
-                "Earnings Growth": fundamentals.get("earningsGrowth"),
-            },
-            "Profitability": {
-                "Gross Margin": fundamentals.get("grossMargins"),
-                "Operating Margin": fundamentals.get("operatingMargins"),
-                "Profit Margin": fundamentals.get("profitMargins"),
-                "Return on Equity": fundamentals.get("returnOnEquity"),
-            },
-            "Balance Sheet": {
-                "Total Cash": fundamentals.get("totalCash"),
-                "Total Debt": fundamentals.get("totalDebt"),
-                "Debt / Equity": fundamentals.get("debtToEquity"),
-                "Current Ratio": fundamentals.get("currentRatio"),
-            },
-        }
+        st.info("No fundamentals available.")
+        return
+
+    st.caption(
+        "Fundamentals Snapshot summarizes valuation, growth, profitability, balance sheet strength, ownership, "
+        "dividends, analyst targets, and performance data. Blank cells mean the selected source did not provide that field."
+    )
 
     render_fundamental_quality_summary(snapshot)
     render_fundamentals_guide()
@@ -4007,6 +4260,9 @@ def render_simple_fundamentals_tab(fundamentals: dict, fundamentals_snapshot: di
         "Valuation",
         "Earnings / EPS",
         "Growth",
+        "Income Statement - TTM",
+        "Income Statement - Latest Q",
+        "Margins / Returns",
         "Profitability",
         "Balance Sheet",
         "Cash Flow",
@@ -4018,6 +4274,8 @@ def render_simple_fundamentals_tab(fundamentals: dict, fundamentals_snapshot: di
     for section_name in section_order:
         section = snapshot.get(section_name)
         if isinstance(section, dict):
+            if not any(normalize_snapshot_value(value) is not None for value in section.values()):
+                continue
             render_snapshot_metric_grid(section_name, section, columns=4)
 
 
@@ -4092,34 +4350,94 @@ def render_dcf_result_table(title: str, rows: list[dict], column_types: dict[str
 def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None) -> None:
     fundamentals = fundamentals or {}
     detail_row = detail_row or {}
-    revenue_default = get_fundamental_number(fundamentals, "totalRevenue", default=0.0) or 0.0
+    ticker = str(detail_row.get("ticker") or "").strip().upper()
+    sec_dcf_inputs = get_sec_dcf_inputs(ticker) if ticker else {}
+    sec_available = bool(sec_dcf_inputs.get("available"))
+    combined_dcf_values = fundamentals.copy()
+    if sec_available:
+        combined_dcf_values.update(
+            {
+                "totalRevenue": sec_dcf_inputs.get("totalRevenue"),
+                "grossProfit": sec_dcf_inputs.get("grossProfit"),
+                "costOfRevenue": sec_dcf_inputs.get("costOfRevenue"),
+                "grossMargins": sec_dcf_inputs.get("grossMargins"),
+                "researchAndDevelopment": sec_dcf_inputs.get("researchAndDevelopment"),
+                "sellingGeneralAdministrative": sec_dcf_inputs.get("sellingGeneralAdministrative"),
+                "operatingIncome": sec_dcf_inputs.get("operatingIncome"),
+                "operatingMargins": sec_dcf_inputs.get("operatingMargins"),
+                "ebitda": sec_dcf_inputs.get("ebitda"),
+                "depreciationAmortization": sec_dcf_inputs.get("depreciationAmortization"),
+                "interestExpense": sec_dcf_inputs.get("interestExpense"),
+                "pretaxIncome": sec_dcf_inputs.get("pretaxIncome"),
+                "incomeTaxExpense": sec_dcf_inputs.get("incomeTaxExpense"),
+                "netIncome": sec_dcf_inputs.get("netIncome"),
+                "profitMargins": sec_dcf_inputs.get("profitMargins"),
+                "totalCash": sec_dcf_inputs.get("totalCash"),
+                "totalDebt": sec_dcf_inputs.get("totalDebt"),
+                "sharesOutstanding": sec_dcf_inputs.get("sharesOutstanding"),
+                "minorityInterest": sec_dcf_inputs.get("minorityInterest"),
+                "totalInvestments": sec_dcf_inputs.get("totalInvestments"),
+                "freeCashflow": sec_dcf_inputs.get("freeCashflow"),
+            }
+        )
+    revenue_default = get_fundamental_number(combined_dcf_values, "totalRevenue", default=0.0) or 0.0
     current_price = safe_numeric(detail_row.get("price"))
-    current_margin_default = get_fundamental_number(fundamentals, "operatingMargins", default=0.10) or 0.10
+    current_margin_default = get_fundamental_number(combined_dcf_values, "operatingMargins", default=0.10) or 0.10
     if current_margin_default < -0.50 or current_margin_default > 0.70:
         current_margin_default = 0.10
 
-    ebit_default = get_fundamental_number(fundamentals, "operatingIncome", "ebit")
+    ebit_default = get_fundamental_number(combined_dcf_values, "operatingIncome", "ebit")
     if ebit_default is None and revenue_default:
         ebit_default = revenue_default * current_margin_default
 
     beta_default = get_fundamental_number(fundamentals, "beta", default=1.0) or 1.0
-    cash_default = get_fundamental_number(fundamentals, "totalCash", default=0.0) or 0.0
-    debt_default = get_fundamental_number(fundamentals, "totalDebt", default=0.0) or 0.0
-    shares_default = get_fundamental_number(fundamentals, "sharesOutstanding", default=0.0) or 0.0
-    minority_default = get_fundamental_number(fundamentals, "minorityInterest", default=0.0) or 0.0
-    investments_default = get_fundamental_number(fundamentals, "totalInvestments", "longTermInvestments", default=0.0) or 0.0
-    free_cash_flow = get_fundamental_number(fundamentals, "freeCashflow")
-    ticker = str(detail_row.get("ticker") or "").strip().upper()
+    cash_default = get_fundamental_number(combined_dcf_values, "totalCash", default=0.0) or 0.0
+    debt_default = get_fundamental_number(combined_dcf_values, "totalDebt", default=0.0) or 0.0
+    shares_default = get_fundamental_number(combined_dcf_values, "sharesOutstanding", default=0.0) or 0.0
+    minority_default = get_fundamental_number(combined_dcf_values, "minorityInterest", default=0.0) or 0.0
+    investments_default = get_fundamental_number(combined_dcf_values, "totalInvestments", "longTermInvestments", default=0.0) or 0.0
+    free_cash_flow = get_fundamental_number(combined_dcf_values, "freeCashflow")
     try:
         wacc_inputs = get_default_wacc_inputs(ticker)
     except Exception:
         wacc_inputs = {"wacc": 0.10, "source_note": "Using default WACC fallback."}
     auto_wacc_default = clamp_slider_default((safe_numeric(wacc_inputs.get("wacc")) or 0.10) * 100, 4.0, 20.0)
 
-    st.caption("This is a rough intrinsic value model. The output is only as good as the story and assumptions.")
+    st.caption("This is a story-driven FCFF model: revenue growth, margins, reinvestment efficiency, cost of capital, and terminal excess returns drive value.")
+    with st.expander("DCF Model Method", expanded=False):
+        st.caption("Operating value is built from revenue, operating margin, taxes, reinvestment, FCFF, and a cost-of-capital path.")
+        st.caption("Explicit reinvestment is tied to growth through sales-to-capital: reinvestment = change in revenue / sales-to-capital.")
+        st.caption("Terminal reinvestment is tied to stable growth and mature ROIC: terminal reinvestment rate = terminal growth / terminal ROIC.")
+        st.caption("Enterprise value is bridged to equity value by adding cash/investments and subtracting debt and minority interest.")
+    if sec_available:
+        st.caption(
+            (
+                f"SEC source: {sec_dcf_inputs.get('entity_name') or ticker} | "
+                f"Latest period: {sec_dcf_inputs.get('latest_period') or 'N/A'} | "
+                f"Filed: {sec_dcf_inputs.get('latest_filed') or 'N/A'} | "
+                f"Periods used for TTM: {', '.join(sec_dcf_inputs.get('source_periods') or []) or 'N/A'}"
+            )
+        )
+        st.caption("DCF uses SEC filings for financial statement inputs and Yahoo for market-linked inputs such as beta and cost-of-capital defaults.")
+    else:
+        st.caption("DCF uses Yahoo defaults where SEC companyfacts are unavailable.")
+    dcf_defaults_key = f"{ticker}-combined"
+    if st.session_state.get("dcf-defaults-source-key") != dcf_defaults_key:
+        st.session_state["dcf-revenue-b"] = clamp_slider_default(revenue_default / 1_000_000_000, 0.0, 500.0)
+        st.session_state["dcf-current-op-margin"] = clamp_slider_default(current_margin_default * 100, -50.0, 50.0)
+        st.session_state["dcf-target-margin"] = clamp_slider_default(max(current_margin_default * 100, 12.0), -20.0, 60.0)
+        st.session_state["dcf-terminal-margin"] = clamp_slider_default(max(current_margin_default * 100, 12.0), -10.0, 40.0)
+        st.session_state["dcf-cash-b"] = max(0.0, cash_default / 1_000_000_000)
+        st.session_state["dcf-debt-b"] = max(0.0, debt_default / 1_000_000_000)
+        st.session_state["dcf-shares-m"] = max(0.0, shares_default / 1_000_000)
+        st.session_state["dcf-minority-b"] = max(0.0, minority_default / 1_000_000_000)
+        st.session_state["dcf-investments-b"] = max(0.0, investments_default / 1_000_000_000)
+        st.session_state["dcf-terminal-sales-capital"] = 2.0
+        st.session_state["dcf-terminal-wacc"] = clamp_slider_default(max(auto_wacc_default - 0.5, 4.0), 4.0, 20.0)
+        st.session_state["dcf-defaults-source-key"] = dcf_defaults_key
 
     with st.expander("Story / Assumptions", expanded=True):
-        st.caption("Model structure: value the operating business with FCFF, discount at WACC, then bridge enterprise value to equity value.")
+        st.caption("Model structure: value operating assets with FCFF, discount at a cost-of-capital path, then bridge enterprise value to equity value.")
         auto_wacc = st.checkbox("Auto-calculate WACC", value=True, key="dcf-auto-wacc")
         if auto_wacc:
             last_auto_ticker = st.session_state.get("dcf-auto-wacc-ticker")
@@ -4153,16 +4471,20 @@ def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None)
             high_growth = st.slider("Revenue growth years 1-5 (%)", min_value=-20.0, max_value=50.0, value=6.0, step=0.5, key="dcf-high-growth") / 100
             fade_growth = st.slider("Revenue growth year 6 (%)", min_value=-10.0, max_value=30.0, value=4.0, step=0.5, key="dcf-fade-growth") / 100
             projection_years = int(st.slider("Projection years", min_value=5, max_value=15, value=10, step=1, key="dcf-years"))
+            high_growth_years = int(st.slider("High-growth years", min_value=1, max_value=max(projection_years - 1, 1), value=min(5, max(projection_years - 1, 1)), step=1, key="dcf-high-growth-years"))
         with col3:
             target_margin = st.slider("Target operating margin (%)", min_value=-20.0, max_value=60.0, value=clamp_slider_default(max(current_margin_default * 100, 12.0), -20.0, 60.0), step=0.5, key="dcf-target-margin") / 100
             years_to_margin = int(st.slider("Years to target margin", min_value=1, max_value=10, value=5, step=1, key="dcf-years-to-margin"))
             terminal_margin = st.slider("Terminal operating margin (%)", min_value=-10.0, max_value=40.0, value=clamp_slider_default(max(current_margin_default * 100, 12.0), -10.0, 40.0), step=0.5, key="dcf-terminal-margin") / 100
         with col4:
-            sales_to_capital = st.slider("Sales-to-capital ratio", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key="dcf-sales-capital")
+            sales_to_capital = st.slider("Sales-to-capital years 1-5", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key="dcf-sales-capital")
+            terminal_sales_to_capital = st.slider("Mature sales-to-capital", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key="dcf-terminal-sales-capital")
             wacc_default = auto_wacc_default if auto_wacc else 10.0
             if "dcf-wacc" not in st.session_state:
                 st.session_state["dcf-wacc"] = wacc_default
             wacc = st.slider("WACC / cost of capital (%)", min_value=4.0, max_value=20.0, step=0.25, key="dcf-wacc") / 100
+            terminal_wacc_default = clamp_slider_default(max((wacc * 100) - 0.5, 4.0), 4.0, 20.0)
+            terminal_wacc = st.slider("Mature WACC (%)", min_value=4.0, max_value=20.0, value=terminal_wacc_default, step=0.25, key="dcf-terminal-wacc") / 100
             terminal_growth = st.slider("Terminal growth (%)", min_value=0.0, max_value=5.0, value=2.5, step=0.25, key="dcf-terminal-growth") / 100
 
         with st.expander("Advanced Cost of Capital"):
@@ -4198,7 +4520,7 @@ def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None)
             with col5:
                 investments_billions = st.number_input("Non-operating investments ($B)", min_value=0.0, value=max(0.0, investments_default / 1_000_000_000), step=0.1, format="%.2f", key="dcf-investments-b")
 
-    terminal_roic_default = max(wacc + 0.01, terminal_growth + 0.01)
+    terminal_roic_default = max(terminal_wacc + 0.01, terminal_growth + 0.01)
     col1, col2, col3 = st.columns(3)
     with col1:
         terminal_roic = st.slider(
@@ -4226,11 +4548,14 @@ def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None)
         investments=investments_billions * 1_000_000_000,
         high_growth_rate=high_growth,
         fade_growth_rate=fade_growth,
+        high_growth_years=high_growth_years,
         target_operating_margin=target_margin,
         years_to_target_margin=years_to_margin,
         projection_years=projection_years,
         sales_to_capital_ratio=sales_to_capital,
+        terminal_sales_to_capital_ratio=terminal_sales_to_capital,
         wacc=wacc,
+        terminal_cost_of_capital=terminal_wacc,
         terminal_growth_rate=terminal_growth,
         terminal_operating_margin=terminal_margin,
         terminal_roic=terminal_roic,
@@ -4265,24 +4590,27 @@ def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None)
     render_compact_metric_grid(
         "Cost of Capital",
         [
-            ("WACC", f"{assumptions.wacc * 100:.2f}%"),
+            ("Starting WACC", f"{assumptions.wacc * 100:.2f}%"),
+            ("Mature WACC", f"{assumptions.terminal_cost_of_capital * 100:.2f}%"),
             ("Risk-Free Rate", format_dcf_percent(wacc_inputs.get("risk_free_rate"))),
             ("Equity Risk Premium", format_dcf_percent(wacc_inputs.get("equity_risk_premium"))),
             ("Beta", f"{safe_numeric(wacc_inputs.get('beta')):.2f}" if safe_numeric(wacc_inputs.get("beta")) is not None else "N/A"),
             ("Pre-Tax Cost of Debt", format_dcf_percent(wacc_inputs.get("pre_tax_cost_of_debt"))),
             ("Debt-to-Capital", format_dcf_percent(wacc_inputs.get("debt_weight"))),
         ],
-        columns=3,
+        columns=4,
     )
     render_compact_metric_grid(
         "Reinvestment",
         [
-            ("Sales-to-Capital", f"{assumptions.sales_to_capital_ratio:.2f}x"),
+            ("Starting Sales-to-Capital", f"{assumptions.sales_to_capital_ratio:.2f}x"),
+            ("Mature Sales-to-Capital", f"{assumptions.terminal_sales_to_capital_ratio:.2f}x"),
             ("Terminal ROIC", f"{assumptions.terminal_roic * 100:.1f}%"),
+            ("Terminal Excess Return", f"{(assumptions.terminal_roic - assumptions.terminal_cost_of_capital) * 100:.1f}%"),
             ("Terminal Reinvestment Rate", format_percent_ratio(terminal_reinvestment_rate)),
             ("Reference FCF", format_compact_money(free_cash_flow)),
         ],
-        columns=4,
+        columns=3,
     )
 
     forecast_rows = result.get("forecast", [])
@@ -4294,6 +4622,7 @@ def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None)
             "Operating Margin": row["Operating Margin"],
             "EBIT": row["EBIT"],
             "NOPAT": row["NOPAT"],
+            "Cost of Capital": row["Cost of Capital"],
         }
         for row in forecast_rows
     ]
@@ -4301,7 +4630,11 @@ def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None)
         {
             "Year": row["Year"],
             "Reinvestment": row["Reinvestment"],
+            "Reinvestment Rate": row["Reinvestment Rate"],
             "FCFF": row["FCFF"],
+            "Sales-to-Capital": row["Sales-to-Capital"],
+            "ROIC": row["ROIC"],
+            "Discount Factor": row["Discount Factor"],
             "PV FCFF": row["PV FCFF"],
         }
         for row in forecast_rows
@@ -4316,6 +4649,7 @@ def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None)
             "Operating Margin": "percent",
             "EBIT": "money",
             "NOPAT": "money",
+            "Cost of Capital": "percent",
         },
     )
     render_dcf_result_table(
@@ -4323,7 +4657,11 @@ def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None)
         fcff_rows,
         {
             "Reinvestment": "money",
+            "Reinvestment Rate": "percent",
             "FCFF": "money",
+            "Sales-to-Capital": "multiple",
+            "ROIC": "percent",
+            "Discount Factor": "number",
             "PV FCFF": "money",
         },
     )
@@ -4361,8 +4699,10 @@ def render_damodaran_dcf_tab(fundamentals: dict, detail_row: dict | None = None)
             "Revenue CAGR": "percent",
             "Target Operating Margin": "percent",
             "WACC": "percent",
+            "Terminal WACC": "percent",
             "Terminal Growth": "percent",
             "Sales-to-Capital": "multiple",
+            "Mature Sales-to-Capital": "multiple",
             "Fair Value / Share": "price",
             "Current Price": "price",
             "Upside / Downside": "signed_percent",
@@ -5432,6 +5772,146 @@ def render_stock_guidance(
     )
 
 
+def extract_prices_from_summary(summary: str | None) -> tuple[float | None, float | None]:
+    if not summary:
+        return None, None
+    matches = [safe_numeric(value.replace("$", "").replace(",", "")) for value in re.findall(r"\$([0-9]+(?:\.[0-9]+)?)", str(summary))]
+    if len(matches) >= 2:
+        return matches[0], matches[1]
+    if len(matches) == 1:
+        return matches[0], None
+    return None, None
+
+
+def build_local_trade_ideas(
+    detail_row: dict,
+    fundamentals: dict,
+    fundamentals_snapshot: dict | None,
+    chart_history=None,
+) -> list[dict]:
+    context = get_long_trend_context(detail_row, chart_history=chart_history)
+    technical = build_technical_readout(chart_history, ticker=detail_row.get("ticker")) if chart_history is not None else {}
+    fundamental_bias = build_fundamental_guidance(fundamentals)
+    price = safe_numeric(detail_row.get("price"))
+    ema8 = safe_numeric(context.get("ema8"))
+    ema21 = safe_numeric(context.get("ema21"))
+    sma50 = safe_numeric(context.get("sma50"))
+    sma200 = safe_numeric(context.get("sma200"))
+    high_52w = safe_numeric(fundamentals.get("fiftyTwoWeekHigh"))
+    low_52w = safe_numeric(fundamentals.get("fiftyTwoWeekLow"))
+    atr_pct = safe_numeric(detail_row.get("atr_pct"))
+    atr_dollars = price * atr_pct / 100 if price is not None and atr_pct is not None else None
+    support, resistance = extract_prices_from_summary(technical.get("support_resistance_summary"))
+    trend_status = str(context.get("long_status") or "")
+    extension_status = str(context.get("extension_status") or "")
+    pullback_quality = str(context.get("pullback_quality") or "")
+    volume_ratio = safe_numeric(detail_row.get("volume_ratio"))
+    fundamental_label = str((fundamental_bias.get("bias") or {}).get("label") or "Mixed Fundamentals")
+    momentum_summary = str(technical.get("momentum_summary") or "").strip()
+    support_summary = str(technical.get("support_resistance_summary") or "").strip()
+    swing_read = str(technical.get("swing_read") or "").strip()
+
+    def fmt_price(value: object) -> str:
+        return format_price(value)
+
+    def fmt_pct(value: object) -> str:
+        return format_signed_percent_optional(value, decimals=1)
+
+    ideas: list[dict] = []
+
+    if trend_status in {"Strong Long Setup", "Pullback Entry Setup"} and extension_status != "Too Extended":
+        entry_anchor = resistance or ema21 or high_52w or price
+        stop_anchor = min([value for value in (support, sma50, ema21, low_52w) if value is not None], default=None)
+        if stop_anchor is None and price is not None and atr_dollars is not None:
+            stop_anchor = price - atr_dollars * 1.5
+        target_anchor = high_52w or (resistance * 1.06 if resistance is not None else None)
+        if entry_anchor is not None and stop_anchor is not None:
+            ideas.append(
+                {
+                    "title": "Primary: momentum continuation long",
+                    "summary": "Use this when the trend is already working and price can keep confirming strength.",
+                    "entry": f"Above {fmt_price(entry_anchor)}",
+                    "stop": f"Below {fmt_price(stop_anchor)}",
+                    "target": fmt_price(target_anchor),
+                    "confidence": "High" if trend_status == "Strong Long Setup" and volume_ratio is not None and volume_ratio >= 1.2 else "Medium",
+                    "why": f"Trend status is {trend_status.lower() or 'constructive'}, volume is {format_optional_number(volume_ratio)}x, and the fundamental read is {fundamental_label.lower()}. {momentum_summary}",
+                }
+            )
+
+    if trend_status in {"Strong Long Setup", "Pullback Entry Setup", "Long Watchlist"} and extension_status != "Too Extended":
+        pullback_entry = ema21 or ema8 or sma50 or price
+        pullback_stop = min([value for value in (sma50, sma200, support, low_52w) if value is not None], default=None)
+        if pullback_stop is None and pullback_entry is not None and atr_dollars is not None:
+            pullback_stop = pullback_entry - atr_dollars * 1.25
+        pullback_target = high_52w or resistance or price
+        if pullback_entry is not None and pullback_stop is not None:
+            ideas.append(
+                {
+                    "title": "Alternate: pullback buy on reclaim",
+                    "summary": "A lower-stress entry that waits for the stock to hold a nearby moving-average zone.",
+                    "entry": f"Buy the zone near {fmt_price(pullback_entry)}",
+                    "stop": f"Below {fmt_price(pullback_stop)}",
+                    "target": fmt_price(pullback_target),
+                    "confidence": "Medium" if trend_status != "Long Watchlist" else "Low",
+                    "why": f"Pullback quality is {pullback_quality or 'not fully defined'}, support/resistance reads {support_summary or 'as nearby moving averages and recent range'}, and the setup stays cleaner when volume is not collapsing.",
+                }
+            )
+
+    if extension_status in {"Extended", "Too Extended"} or trend_status in {"Weak / Avoid", "Below Key MAs"}:
+        watch_trigger = resistance or ema21 or sma50 or high_52w
+        invalidation = sma200 or low_52w or sma50
+        ideas.append(
+            {
+                "title": "Defensive: wait for repair",
+                "summary": "This is the local no-chase idea when price is extended or trend quality is not clean.",
+                "entry": f"Wait for a close back above {fmt_price(watch_trigger)}" if watch_trigger is not None else "Wait for a cleaner reclaim",
+                "stop": f"Invalidate below {fmt_price(invalidation)}" if invalidation is not None else "Use the next major moving average as invalidation",
+                "target": fmt_price(high_52w or resistance),
+                "confidence": "High",
+                "why": f"Trend status is {trend_status.lower() or 'unavailable'} and extension status is {extension_status.lower() or 'unknown'}. The app should not force a long idea when the structure still needs repair.",
+            }
+        )
+
+    if not ideas:
+        ideas.append(
+            {
+                "title": "No clean local idea",
+                "summary": "The local engine does not see a clean swing setup right now.",
+                "entry": "N/A",
+                "stop": "N/A",
+                "target": "N/A",
+                "confidence": "Low",
+                "why": f"{swing_read or 'The chart read is incomplete.'} {support_summary or ''}".strip(),
+            }
+        )
+
+    return ideas[:3]
+
+
+def render_local_trade_ideas(
+    detail_row: dict,
+    fundamentals: dict,
+    fundamentals_snapshot: dict | None,
+    chart_history=None,
+) -> None:
+    ideas = build_local_trade_ideas(detail_row, fundamentals, fundamentals_snapshot, chart_history=chart_history)
+    with st.expander("AI Trade Ideas", expanded=False):
+        st.caption("Generated locally from the scanner, chart context, and fundamentals. No API call.")
+        for idea in ideas:
+            render_compact_metric_grid(
+                idea["title"],
+                [
+                    ("Entry", idea["entry"]),
+                    ("Stop", idea["stop"]),
+                    ("Target", idea["target"]),
+                    ("Confidence", idea["confidence"]),
+                ],
+                columns=4,
+            )
+            st.caption(idea["summary"])
+            st.write(idea["why"])
+
+
 def render_stock_thesis(
     detail_row: dict,
     fundamentals: dict,
@@ -5561,6 +6041,12 @@ def render_stock_detail(
         fundamentals_snapshot=fundamentals_snapshot,
         chart_history=chart_history,
     )
+    render_local_trade_ideas(
+        detail_row=detail_row,
+        fundamentals=fundamentals,
+        fundamentals_snapshot=fundamentals_snapshot,
+        chart_history=chart_history,
+    )
     render_simple_ma_summary(detail_row, chart_history=chart_history)
     render_historical_ma_reclaim_returns(detail_row.get("ma_reclaim_stats"), ticker=detail_row.get("ticker"))
 
@@ -5572,7 +6058,7 @@ def render_stock_detail(
         else:
             st.info("No chart data available for the selected stock.")
     with fundamentals_tab:
-        render_simple_fundamentals_tab(fundamentals, fundamentals_snapshot=fundamentals_snapshot)
+        render_simple_fundamentals_tab(fundamentals, fundamentals_snapshot=fundamentals_snapshot, detail_row=detail_row)
     with dcf_tab:
         render_damodaran_dcf_tab(fundamentals, detail_row=detail_row)
     with sec_tab:
