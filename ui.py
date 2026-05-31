@@ -8,7 +8,7 @@ from charts import build_technical_readout
 from data_fetch import build_fundamental_quality_summary, get_default_wacc_inputs, get_sec_dcf_inputs
 from dcf import DcfAssumptions, build_sensitivity_table, calculate_damodaran_dcf, calculate_scenarios, safe_float
 from scoring import get_score_explanation
-from scanner import SCAN_MODE_CONFIG, get_scan_mode_default_limit
+from scanner import SCAN_MODE_CONFIG, filter_setup_mode, get_scan_mode_default_limit
 from symbol_universe import EX_MAJOR_INDEXES_UNIVERSE, FULL_MARKET_UNIVERSE, get_symbol_metadata
 from ticker_lookup import build_ticker_lookup, ticker_from_option
 from universes import get_universe_count, get_universe_label, get_universe_note, get_universe_option_label, get_universe_warning, is_universe_available
@@ -547,9 +547,9 @@ def render_max_price_control() -> float | None:
     )
 
 
-def render_controls(universe_names: list[str]) -> tuple[str, int, int, int, str, dict, bool, bool, bool]:
+def render_controls(universe_names: list[str]) -> tuple[str, str, int, int, int, str, dict, bool, bool, bool]:
     st.title("Stock Screener")
-    st.caption("Long-only chart scanner focused on EMA8, EMA21, SMA50, and SMA200.")
+    raw_search_ticker = render_ticker_search()
 
     selected_universe = st.selectbox("Universe", universe_names, index=0, format_func=get_universe_option_label)
     is_full_market = str(selected_universe).strip().upper() in {FULL_MARKET_UNIVERSE, EX_MAJOR_INDEXES_UNIVERSE}
@@ -561,112 +561,44 @@ def render_controls(universe_names: list[str]) -> tuple[str, int, int, int, str,
     if universe_warning:
         st.warning(universe_warning)
     if is_full_market:
-        with st.expander("All NYSE + Nasdaq Common Stocks Guide", expanded=False):
-            if str(selected_universe).strip().upper() == EX_MAJOR_INDEXES_UNIVERSE:
-                st.write(
-                    "All NYSE + Nasdaq — Ex Major Indexes: This is a broad discovery universe. It excludes stocks "
-                    "already covered by the main index universes, which can make the scan faster and help surface "
-                    "names not already appearing in S&P 500, Nasdaq 100, Russell 2000, or MidCap 400 scans."
-                )
-            else:
-                st.write(
-                    "This universe attempts to scan all NYSE and Nasdaq listed common stocks. It removes ETFs, funds, "
-                    "warrants, units, rights, preferreds, notes, bonds, trusts, test issues, and other non-common-stock "
-                    "securities. It does not prefilter by price, volume, market cap, or trend, so small caps and micro "
-                    "caps can appear. Because this universe is large, the scan can take longer than index-based scans."
-                )
-            st.warning("Full-market scans can be slow. For best performance, run a full snapshot once, then load the saved snapshot.")
-            st.caption("For the full NYSE + Nasdaq scan, it may be better to run build_market_snapshot.py from PowerShell, then load the saved snapshot in the app.")
+        st.warning("Full-market updates can take several minutes. Show Saved Results is the faster path once a snapshot exists.")
 
     min_score = 0
-    st.markdown("### Scanner Controls")
-    col1, col2, col3 = st.columns([1.1, 1.1, 1.8])
+    st.markdown("### Scan")
+    col1, col2 = st.columns([1.0, 2.6])
     with col1:
         max_results = st.slider("Max results", min_value=3, max_value=50, value=10, step=1)
     with col2:
         if is_full_market:
-            st.caption("Universe size: all common stocks")
             max_tickers = 0
         else:
             universe_count = get_universe_count(selected_universe)
-            default_ticker_limit = get_default_ticker_limit(selected_universe, scan_mode)
-            max_ticker_slider_value = max(10, universe_count or 2000)
-            ticker_slider_key = f"max-tickers-{selected_universe}-{scan_mode}"
-            if st.session_state.get("last_max_ticker_universe") != selected_universe:
-                st.session_state[ticker_slider_key] = min(default_ticker_limit, max_ticker_slider_value)
-                st.session_state["last_max_ticker_universe"] = selected_universe
-            max_tickers = st.slider(
-                "Max tickers to scan",
-                min_value=10,
-                max_value=max_ticker_slider_value,
-                value=min(default_ticker_limit, max_ticker_slider_value),
-                step=1,
-                key=ticker_slider_key,
-                help="Caps how many tickers are included in the snapshot scan.",
-            )
-    with col3:
+            max_tickers = min(get_default_ticker_limit(selected_universe, scan_mode), max(10, universe_count or 2000))
         run_label = "Show Saved Results" if is_full_market else "Show Results"
         refresh_label = "Update Full-Market Data" if is_full_market else "Update Market Data"
-        run_scan = st.button(run_label, type="primary", disabled=not is_universe_available(selected_universe))
-        refresh_snapshot = st.button(
-            refresh_label,
-            disabled=not is_universe_available(selected_universe),
-        )
-        if is_full_market:
-            st.caption("Show Saved Results is fast. Update Full-Market Data downloads every common stock and can take several minutes.")
-        else:
-            st.caption("Show Results uses the saved snapshot. Update Market Data downloads fresh prices and rebuilds it.")
-
-    st.markdown("### Results View")
-    setup_view_labels = [
-        "All Trend Setups",
-        "Best A+ Setups",
-        "Fresh Breakouts",
-        "Breakout Retests",
-        "Pre-Breakout Bases",
-    ]
-    setup_view_to_mode = {
-        "All Trend Setups": "Main Trend Scanner",
-        "Best A+ Setups": "A+ Setup Mode",
-        "Fresh Breakouts": "Fresh Breakouts",
-        "Breakout Retests": "Breakout Retests",
-        "Pre-Breakout Bases": "Pre-Breakout Watchlist",
-    }
-    selected_setup_view = st.selectbox(
-        "Show",
-        setup_view_labels,
-        index=0,
-        key="results-view",
-        help="Filters the saved snapshot by setup type and quality.",
-    )
-    setup_mode = setup_view_to_mode[selected_setup_view]
-    setup_descriptions = {
-        "All Trend Setups": "All Trend Setups shows the broader long-only trend scanner results from the saved snapshot.",
-        "Best A+ Setups": "Best A+ Setups only shows higher-quality long setups where trend, base structure, risk/reward, market regime, and trigger quality are aligned. This mode is stricter and may return fewer stocks.",
-        "Fresh Breakouts": "Fresh Breakouts finds stocks breaking above recent resistance. Stronger breakouts close near the day's high, happen on above-average volume, and occur in a supportive market regime.",
-        "Breakout Retests": "Breakout Retest looks for stocks that already broke out, pulled back toward the breakout area, and are trying to hold support. This can produce cleaner entries than chasing the first breakout candle.",
-        "Pre-Breakout Bases": "Pre-Breakout Bases finds stocks building tight bases below resistance. These are not confirmed breakouts yet. They are watchlist names that may trigger if price closes above the pivot with volume.",
-    }
-    st.caption(setup_descriptions.get(selected_setup_view, ""))
-    with st.expander("Results View Guide", expanded=False):
-        for label in setup_view_labels:
-            st.markdown(f"**{label}:** {setup_descriptions[label]}")
-    calculate_historical_edge = st.checkbox(
-        "Calculate Historical Edge",
-        value=False,
-        key="calculate-historical-edge",
-        help="Adds per-ticker historical event testing during snapshot refresh. This is slower, so it is optional.",
-    )
-    if is_full_market and calculate_historical_edge:
-        st.warning("Historical Edge on the full NYSE + Nasdaq universe can be slow.")
+        action_col, refresh_col = st.columns([1.0, 1.2])
+        with action_col:
+            run_scan = st.button(run_label, type="primary", disabled=not is_universe_available(selected_universe))
+        with refresh_col:
+            refresh_snapshot = st.button(
+                refresh_label,
+                disabled=not is_universe_available(selected_universe),
+            )
 
     with st.expander("Advanced Scanner Filters", expanded=False):
-        st.caption("Filters are optional. A filter is only applied when its checkbox is enabled. By default, no advanced filters are applied.")
         filter_reset_version = st.session_state.get("advanced_filter_reset_version", 0)
         filter_key_prefix = f"scan-filter-{selected_universe}-{filter_reset_version}"
         if st.button("Reset Filters", key=f"{filter_key_prefix}-reset"):
             st.session_state["advanced_filter_reset_version"] = filter_reset_version + 1
             st.rerun()
+        calculate_historical_edge = st.checkbox(
+            "Calculate Historical Edge on refresh",
+            value=False,
+            key="calculate-historical-edge",
+            help="Optional and slower. Used only when rebuilding market data.",
+        )
+        if is_full_market and calculate_historical_edge:
+            st.warning("Historical Edge on the full NYSE + Nasdaq universe can be slow.")
         price_col, volume_col, trend_col = st.columns([1.2, 1.2, 1.0])
         with price_col:
             use_price_filter = st.checkbox("Use price filter", value=False, key=f"{filter_key_prefix}-use-price-filter")
@@ -748,10 +680,10 @@ def render_controls(universe_names: list[str]) -> tuple[str, int, int, int, str,
         "above_sma200": above_sma200,
         "use_trend_status_filter": trend_status_filter != "All",
         "trend_status_filter_values": [trend_status_filter] if trend_status_filter != "All" else [],
-        "setup_mode": setup_mode,
+        "display_limit": max_results,
     }
 
-    return selected_universe, min_score, max_results, max_tickers, scan_mode, scanner_filters, refresh_snapshot, run_scan, calculate_historical_edge
+    return raw_search_ticker, selected_universe, min_score, max_results, max_tickers, scan_mode, scanner_filters, refresh_snapshot, run_scan, calculate_historical_edge
 
 
 def render_ma_scanner_controls(universe_names: list[str], lookback_options: list[str]) -> tuple[str, str, str, list[str], int, int, int, bool]:
@@ -995,9 +927,32 @@ def render_page(universe_name: str, scan_results: dict) -> None:
 
 
 def render_main_trend_scanner(scan_results: dict, scanner_filters: dict | None = None) -> None:
-    setup_mode = (scanner_filters or {}).get("setup_mode", "Main Trend Scanner")
-    st.markdown("### Results Table")
-    st.caption("Finds stocks already in strong uptrends using price position, moving-average alignment, setup quality, market regime, and relative volume.")
+    setup_view_labels = [
+        "All Trend Setups",
+        "Best A+ Setups",
+        "Fresh Breakouts",
+        "Breakout Retests",
+        "Pre-Breakout Bases",
+    ]
+    setup_view_to_mode = {
+        "All Trend Setups": "Main Trend Scanner",
+        "Best A+ Setups": "A+ Setup Mode",
+        "Fresh Breakouts": "Fresh Breakouts",
+        "Breakout Retests": "Breakout Retests",
+        "Pre-Breakout Bases": "Pre-Breakout Watchlist",
+    }
+    selected_setup_view = st.selectbox(
+        "Trend setup view",
+        setup_view_labels,
+        index=0,
+        key="main-trend-results-view",
+        help="Filters the loaded trend-scan results by setup type.",
+    )
+    setup_mode = setup_view_to_mode[selected_setup_view]
+    display_limit = int((scanner_filters or {}).get("display_limit") or 10)
+    display_rows = filter_setup_mode(scan_results.get("all_ranked", []), setup_mode)[:display_limit]
+
+    st.markdown("### Results")
     render_market_regime_status(scan_results)
     render_score_summary(scan_results)
     render_signal_score_methodology()
@@ -1006,7 +961,7 @@ def render_main_trend_scanner(scan_results: dict, scanner_filters: dict | None =
     render_setup_type_guide()
     render_historical_edge_explanation()
     render_price_filter_note(scanner_filters)
-    render_setup_quality_table(setup_mode, scan_results.get("all_ranked", []), key_prefix="ranked")
+    render_setup_quality_table(selected_setup_view, display_rows, key_prefix="ranked")
 
 
 def render_score_summary(scan_results: dict | None) -> None:
@@ -1812,9 +1767,19 @@ def render_stock_detail_styles() -> None:
     st.markdown(
         """
         <style>
+        .block-container {
+            max-width: 1520px;
+            padding-top: 3.25rem;
+            padding-left: 1.15rem;
+            padding-right: 1.15rem;
+        }
+        header[data-testid="stHeader"] {
+            background: rgba(244, 247, 251, 0.96);
+            backdrop-filter: blur(6px);
+        }
         .stApp {
-            background: #f8fafc;
-            color: #111827;
+            background: #f4f7fb;
+            color: #0f172a;
         }
         section[data-testid="stSidebar"] {
             background: #ffffff;
@@ -1824,7 +1789,7 @@ def render_stock_detail_styles() -> None:
         div[data-testid="stText"],
         label,
         p {
-            color: #111827;
+            color: #0f172a;
         }
         div[data-testid="stCaptionContainer"],
         small {
@@ -1832,9 +1797,9 @@ def render_stock_detail_styles() -> None:
         }
         div.stButton > button {
             background: #ffffff;
-            color: #111827;
+            color: #0f172a;
             border: 1px solid #cbd5e1;
-            border-radius: 6px;
+            border-radius: 8px;
             box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
         }
         div.stButton > button:hover {
@@ -1848,22 +1813,51 @@ def render_stock_detail_styles() -> None:
             border-color: #e5e7eb;
         }
         div[data-testid="stMetric"] {
-            background: #ffffff;
-            border: 1px solid #e5e7eb;
-            border-radius: 6px;
-            padding: 0.6rem 0.7rem;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            border: 1px solid #dbe3ee;
+            border-radius: 8px;
+            padding: 0.72rem 0.82rem;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        }
+        div[data-testid="stMetricLabel"] {
+            color: #64748b;
+            font-size: 0.74rem;
+            font-weight: 760;
+        }
+        div[data-testid="stMetricValue"] {
+            color: #0f172a;
+            font-size: 1.04rem;
+            font-weight: 850;
         }
         div[data-testid="stTabs"] button {
-            border-radius: 5px 5px 0 0;
+            border-radius: 8px 8px 0 0;
             color: #475569;
             font-size: 0.9rem;
             font-weight: 680;
-            padding: 0.46rem 0.82rem;
+            padding: 0.5rem 0.84rem;
         }
         div[data-testid="stTabs"] button[aria-selected="true"] {
-            color: #111827;
+            color: #0f172a;
             background: #ffffff;
             border-bottom-color: #2563eb;
+        }
+        div[data-testid="stDataFrame"] {
+            border: 1px solid #dbe3ee;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #ffffff;
+        }
+        div[data-testid="stDataFrame"] [role="grid"] {
+            font-size: 0.86rem;
+        }
+        div[data-testid="stExpander"] {
+            border: 1px solid #dbe3ee;
+            border-radius: 8px;
+            background: #ffffff;
+            overflow: hidden;
+        }
+        div[data-testid="stExpander"] details summary {
+            font-weight: 760;
         }
         .detail-section {
             margin: 1rem 0 0.45rem;
@@ -5922,78 +5916,35 @@ def render_stock_thesis(
     forward_profile: dict | None = None,
     chart_history=None,
 ) -> None:
-    ticker = str(detail_row.get("ticker") or "Ticker").upper()
     context = get_long_trend_context(detail_row, chart_history=chart_history)
     verdict = get_thesis_verdict(context)
-    earnings_section = build_earnings_thesis_section(fundamentals, earnings_info)
-    sector_section = build_sector_thesis_section(fundamentals, company_profile)
-    future_guidance_section = build_future_guidance_thesis_section(fundamentals, earnings_info, forward_profile)
-    analyst_section = build_analyst_thesis_section(detail_row, fundamentals)
     technical_section = build_technical_thesis_section(detail_row, chart_history, context)
+    confirmation_items = build_confirmation_items(detail_row, context)[:4]
+    risk_items = build_risk_factors(detail_row, fundamentals, earnings_info, context)[:4]
 
-    with st.expander("Thesis - catalysts driving the observed setup", expanded=True):
-        risk_items = "".join(f"<li>{escape(risk)}</li>" for risk in build_risk_factors(detail_row, fundamentals, earnings_info, context))
-        confirmation_items = "".join(f"<li>{escape(item)}</li>" for item in build_confirmation_items(detail_row, context))
-        sources = [
-            "Yahoo Finance price history and fundamentals through yfinance.",
-            "Yahoo Finance analyst recommendation, target, and earnings estimate fields where available.",
-            "Forward earnings and revenue guidance section uses yfinance estimate tables where available.",
-            "Sector section uses Yahoo sector/industry and company profile context; no live sector-news API is connected yet.",
-            "Scanner moving-average calculations from local OHLCV history.",
-            "SEC company submissions helper for latest 10-Q / 10-K metadata." if latest_filing else "SEC helper checked; no latest filing metadata available.",
-        ]
-        if fundamentals_snapshot:
-            sources.append("Local fundamentals snapshot generated by the app.")
-        source_text = " | ".join(sources)
-        stat_html = "".join(
-            [
-                build_thesis_stat_html("Price", format_price(detail_row.get("price"))),
-                build_thesis_stat_html("Setup", context.get("long_status", "N/A")),
-                build_thesis_stat_html("EMA Stack", context.get("ema_stack_status", "N/A")),
-                build_thesis_stat_html("vs EMA21", format_signed_percent(context.get("distance_ema21"))),
-                build_thesis_stat_html("Rel Volume", format_optional_number(detail_row.get("volume_ratio"))),
-            ]
-        )
-        st.markdown(
-            (
-                "<div class='thesis-brief'>"
-                "<div class='thesis-hero'>"
-                "<div>"
-                "<div class='thesis-eyebrow'>Thesis - catalysts driving the observed setup</div>"
-                f"<div class='thesis-headline'>{escape(get_thesis_title(ticker, context))}</div>"
-                f"<div class='thesis-lede'>{escape(get_thesis_summary(ticker, detail_row, fundamentals, context))}</div>"
-                "</div>"
-                "<div class='thesis-verdict'>"
-                "<div class='thesis-verdict-label'>Verdict</div>"
-                f"<div class='thesis-verdict-value'>{escape(verdict['label'])}</div>"
-                f"<div class='thesis-verdict-note'>{escape(verdict['note'])}</div>"
-                "</div>"
-                "</div>"
-                f"<div class='thesis-strip'>{stat_html}</div>"
-                "<div class='thesis-report-label'>Catalysts</div>"
-                "<div class='thesis-section-grid'>"
-                f"{build_thesis_section_html(**earnings_section)}"
-                f"{build_thesis_section_html(**sector_section)}"
-                f"{build_thesis_section_html(**future_guidance_section)}"
-                f"{build_thesis_section_html(**analyst_section)}"
-                f"{build_thesis_section_html(**technical_section, full=True)}"
-                "</div>"
-                "<div class='thesis-confirm-report'>"
-                "<div class='thesis-report-list-title'>Confirmation Checklist</div>"
-                f"<ul class='thesis-report-list'>{confirmation_items}</ul>"
-                "</div>"
-                "<div class='thesis-risk-report'>"
-                "<div class='thesis-report-list-title'>Risk Factors</div>"
-                f"<ul class='thesis-report-list'>{risk_items}</ul>"
-                "</div>"
-                "<div class='thesis-source-footer'>"
-                "<div class='thesis-source-title'>Data Used</div>"
-                f"{escape(source_text)}<br>This is a structured scanner summary, not financial advice."
-                "</div>"
-                "</div>"
-            ),
-            unsafe_allow_html=True,
-        )
+    st.markdown("#### Setup Notes")
+    render_compact_metric_grid(
+        "Current Read",
+        [
+            ("Verdict", verdict["label"]),
+            ("Setup", context.get("long_status", "N/A")),
+            ("EMA Stack", context.get("ema_stack_status", "N/A")),
+            ("vs EMA21", format_signed_percent(context.get("distance_ema21"))),
+            ("Rel Volume", format_optional_number(detail_row.get("volume_ratio"))),
+        ],
+        columns=5,
+    )
+    st.caption(technical_section["text"])
+
+    note_col, risk_col = st.columns(2)
+    with note_col:
+        st.markdown("**Confirmation**")
+        for item in confirmation_items:
+            st.markdown(f"- {item}")
+    with risk_col:
+        st.markdown("**Risks**")
+        for item in risk_items:
+            st.markdown(f"- {item}")
 
 
 def render_stock_detail(
@@ -6036,12 +5987,6 @@ def render_stock_detail(
         chart_history=chart_history,
     )
     render_stock_guidance(
-        detail_row=detail_row,
-        fundamentals=fundamentals,
-        fundamentals_snapshot=fundamentals_snapshot,
-        chart_history=chart_history,
-    )
-    render_local_trade_ideas(
         detail_row=detail_row,
         fundamentals=fundamentals,
         fundamentals_snapshot=fundamentals_snapshot,

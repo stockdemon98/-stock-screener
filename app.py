@@ -9,7 +9,7 @@ from historical_reactions import calculate_ma_reclaim_stats
 from scanner import build_long_trend_snapshot, load_snapshot_for_fast_scan, postprocess_trigger_rows, refresh_scanner_snapshot, run_breakout_scan_from_snapshot, run_fast_scan_from_snapshot, scan_trigger_events
 from ui import render_controls, render_empty_state
 from ui import render_main_trend_scanner, render_price_filter_note, render_scan_not_run, render_scan_summary, render_scanner_description
-from ui import render_breakout_scan_controls, render_breakout_scan_results, render_search_result, render_stock_detail, render_ticker_search, render_trigger_scan_controls, render_trigger_scan_results
+from ui import render_breakout_scan_controls, render_breakout_scan_results, render_search_result, render_stock_detail, render_trigger_scan_controls, render_trigger_scan_results
 from ticker_lookup import build_ticker_lookup
 from universes import get_ticker_memberships, get_universe_names, normalize_ticker
 
@@ -230,7 +230,7 @@ def render_scan_progress_callback(progress_bar, status_box):
 
 
 def main() -> None:
-    st.set_page_config(page_title="Stock Screener", layout="wide")
+    st.set_page_config(page_title="Stock Screener", page_icon=":chart_with_upwards_trend:", layout="wide")
     if "selected_ticker" not in st.session_state:
         st.session_state["selected_ticker"] = None
     if "scan_results" not in st.session_state:
@@ -273,8 +273,8 @@ def main() -> None:
     for state_key in ("scan_universe", "last_snapshot_universe"):
         if st.session_state.get(state_key) not in valid_universes:
             st.session_state[state_key] = None
-    raw_search_ticker = render_ticker_search()
     (
+        raw_search_ticker,
         selected_universe,
         min_score,
         max_results,
@@ -349,7 +349,7 @@ def main() -> None:
             snapshot_meta=capped_snapshot_meta,
             universe_name=selected_universe,
             min_score=min_score,
-            max_results=max_results,
+            max_results=max(max_results, 250),
             optional_filters=scanner_filters,
             progress_callback=render_scan_progress_callback(st.progress(0), st.empty()) if run_stock_scan else None,
         )
@@ -360,10 +360,10 @@ def main() -> None:
     company_name_map = build_company_name_map()
     scan_results = enrich_scan_results(scan_results, company_name_map)
     scanner_universe = st.session_state.get("scan_universe") or selected_universe
-    render_scanner_description(scanner_universe)
-    main_tab, trigger_tab, breakout_tab = st.tabs(["Main Trend Scanner", "Trigger Scan", "Breakout Search"])
+    main_tab, trigger_tab, breakout_tab = st.tabs(["Trend Setups", "MA Triggers", "Breakouts"])
 
     with main_tab:
+        render_scanner_description(scanner_universe)
         if scan_results is None:
             render_scan_not_run()
         elif not scan_results.get("all_ranked"):
